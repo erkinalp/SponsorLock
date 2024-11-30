@@ -1,11 +1,13 @@
 import Config from "../config";
-import { SponsorTime } from "../types";
+import { SegmentUUID, SponsorTime } from "../types";
 import { getSkippingText } from "../utils/categoryUtils";
-import { keybindToString } from "../utils/configUtils";
-import { AnimationUtils } from "../utils/animationUtils";
+import { AnimationUtils } from "../../maze-utils/src/animationUtils";
+import { keybindToString } from "../../maze-utils/src/config";
+import { isMobileControlsOpen } from "../utils/mobileUtils";
 
 export interface SkipButtonControlBarProps {
     skip: (segment: SponsorTime) => void;
+    selectSegment: (UUID: SegmentUUID) => void;
     onMobileYouTube: boolean;
 }
 
@@ -41,7 +43,7 @@ export class SkipButtonControlBar {
 
         this.container = document.createElement("div");
         this.container.classList.add("skipButtonControlBarContainer");
-        this.container.classList.add("hidden");
+        this.container.classList.add("sbhidden");
         if (this.onMobileYouTube) this.container.classList.add("mobile");
 
         this.skipIcon = document.createElement("img");
@@ -54,8 +56,18 @@ export class SkipButtonControlBar {
         this.container.appendChild(this.skipIcon);
         this.container.appendChild(this.textContainer);
         this.container.addEventListener("click", () => this.toggleSkip());
-        this.container.addEventListener("mouseenter", () => this.stopTimer());
-        this.container.addEventListener("mouseleave", () => this.startTimer());
+        this.container.addEventListener("mouseenter", () => {
+            this.stopTimer();
+
+            if (this.segment) {
+                props.selectSegment(this.segment.UUID);
+            }
+        });
+        this.container.addEventListener("mouseleave", () => {
+            this.startTimer();
+
+            props.selectSegment(null);
+        });
         if (this.onMobileYouTube) {
             this.container.addEventListener("touchstart", (e) => this.handleTouchStart(e));
             this.container.addEventListener("touchmove", (e) => this.handleTouchMove(e));
@@ -102,7 +114,8 @@ export class SkipButtonControlBar {
         this.enabled = true;
 
         this.refreshText();
-        this.textContainer?.classList?.remove("hidden");
+        this.container?.classList?.remove("textDisabled");
+        this.textContainer?.classList?.remove("sbhidden");
         AnimationUtils.disableAutoHideAnimation(this.skipIcon);
 
         this.startTimer();
@@ -110,8 +123,8 @@ export class SkipButtonControlBar {
 
     refreshText(): void {
         if (this.segment) {
-            this.chapterText?.classList?.add("hidden");
-            this.container.classList.remove("hidden");
+            this.chapterText?.classList?.add("sbhidden");
+            this.container.classList.remove("sbhidden");
             this.textContainer.innerText = this.getTitle();
             this.skipIcon.setAttribute("title", this.getTitle());
         }
@@ -133,18 +146,23 @@ export class SkipButtonControlBar {
     }
 
     disable(): void {
-        this.container.classList.add("hidden");
-        this.textContainer?.classList?.remove("hidden");
+        this.container.classList.add("sbhidden");
 
-        this.chapterText?.classList?.remove("hidden");
-        this.getChapterPrefix()?.classList?.remove("hidden");
+        this.chapterText?.classList?.remove("sbhidden");
+        this.getChapterPrefix()?.classList?.remove("sbhidden");
 
         this.enabled = false;
     }
 
+    isEnabled(): boolean {
+        return this.enabled;
+    }
+
     toggleSkip(): void {
-        this.skip(this.segment);
-        this.disableText();
+        if (this.segment && this.enabled) {
+            this.skip(this.segment);
+            this.disableText();
+        }
     }
 
     disableText(): void {
@@ -154,10 +172,10 @@ export class SkipButtonControlBar {
         }
 
         this.container.classList.add("textDisabled");
-        this.textContainer?.classList?.add("hidden");
-        this.chapterText?.classList?.remove("hidden");
+        this.textContainer?.classList?.add("sbhidden");
+        this.chapterText?.classList?.remove("sbhidden");
 
-        this.getChapterPrefix()?.classList?.add("hidden");
+        this.getChapterPrefix()?.classList?.add("sbhidden");
 
         AnimationUtils.enableAutoHideAnimation(this.skipIcon);
         if (this.onMobileYouTube) {
@@ -166,10 +184,8 @@ export class SkipButtonControlBar {
     }
 
     updateMobileControls(): void {
-        const overlay = document.getElementById("player-control-overlay");
-
-        if (overlay && this.enabled) {
-            if (overlay?.classList?.contains("fadein")) {
+        if (this.enabled) {
+            if (isMobileControlsOpen()) {
                 this.showButton();
             } else {
                 this.hideButton();
@@ -178,7 +194,7 @@ export class SkipButtonControlBar {
     }
 
     private getTitle(): string {
-        return getSkippingText([this.segment], false) + (this.showKeybindHint ? " (" + keybindToString(Config.config.skipKeybind) + ")" : "");
+        return getSkippingText([this.segment], false) + (this.showKeybindHint ? " (" + keybindToString(Config.config.skipToHighlightKeybind) + ")" : "");
     }
 
     private getChapterPrefix(): HTMLElement {

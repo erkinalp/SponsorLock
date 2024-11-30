@@ -9,12 +9,13 @@ import NoticeTextSelectionComponent from "./NoticeTextSectionComponent";
 import SponsorTimeEditComponent from "./SponsorTimeEditComponent";
 import { getGuidelineInfo } from "../utils/constants";
 import { exportTimes } from "../utils/exporter";
+import { getVideo, isCurrentTimeWrong } from "../../maze-utils/src/video";
 
 export interface SubmissionNoticeProps { 
     // Contains functions and variables from the content script needed by the skip notice
     contentContainer: ContentContainer;
 
-    callback: () => unknown;
+    callback: () => Promise<boolean>;
 
     closeListener: () => void;
 }
@@ -38,6 +39,8 @@ class SubmissionNoticeComponent extends React.Component<SubmissionNoticeProps, S
 
     guidelinesReminder: GenericNotice;
 
+    lastSegmentCount: number;
+
     constructor(props: SubmissionNoticeProps) {
         super(props);
         this.noticeRef = React.createRef();
@@ -47,12 +50,14 @@ class SubmissionNoticeComponent extends React.Component<SubmissionNoticeProps, S
     
         const noticeTitle = chrome.i18n.getMessage("confirmNoticeTitle");
 
+        this.lastSegmentCount = this.props.contentContainer().sponsorTimesSubmitting.length;
+
         // Setup state
         this.state = {
             noticeTitle,
             messages: [],
             idSuffix: "SubmissionNotice"
-        }
+        };
     }
 
     componentDidMount(): void {
@@ -62,15 +67,38 @@ class SubmissionNoticeComponent extends React.Component<SubmissionNoticeProps, S
             this.forceUpdate();
         });
 
-        this.videoObserver.observe(this.contentContainer().v, {
+        this.videoObserver.observe(getVideo(), {
             attributes: true
         });
+
+        // Prevent zooming while changing times
+        document.getElementById("sponsorSkipNoticeMiddleRow" + this.state.idSuffix).addEventListener('wheel', function (event) {
+            if (event.ctrlKey) {
+                event.preventDefault();
+            }
+        }, {passive: false});
     }
 
     componentWillUnmount(): void {
         if (this.videoObserver) {
             this.videoObserver.disconnect();
         }
+    }
+
+    componentDidUpdate() {
+        const currentSegmentCount = this.props.contentContainer().sponsorTimesSubmitting.length;
+        if (currentSegmentCount > this.lastSegmentCount) {
+            this.lastSegmentCount = currentSegmentCount;
+
+            this.scrollToBottom();
+        }
+    }
+
+    scrollToBottom() {
+        const scrollElement = this.noticeRef.current.getElement().current.querySelector("#sponsorSkipNoticeMiddleRowSubmissionNotice");
+        scrollElement.scrollTo({
+            top: scrollElement.scrollHeight + 1000
+        });
     }
 
     render(): React.ReactElement {
@@ -80,7 +108,7 @@ class SubmissionNoticeComponent extends React.Component<SubmissionNoticeProps, S
                 onClick={() => this.sortSegments()}
                 title={chrome.i18n.getMessage("sortSegments")}
                 key="sortButton"
-                src={chrome.extension.getURL("icons/sort.svg")}>
+                src={chrome.runtime.getURL("icons/sort.svg")}>
             </img>;
         const exportButton = 
             <img id={"sponsorSkipExportButton" + this.state.idSuffix} 
@@ -88,7 +116,7 @@ class SubmissionNoticeComponent extends React.Component<SubmissionNoticeProps, S
                 onClick={() => this.exportSegments()}
                 title={chrome.i18n.getMessage("exportSegments")}
                 key="exportButton"
-                src={chrome.extension.getURL("icons/export.svg")}>
+                src={chrome.runtime.getURL("icons/export.svg")}>
             </img>;
         return (
             <NoticeComponent noticeTitle={this.state.noticeTitle}
@@ -104,7 +132,8 @@ class SubmissionNoticeComponent extends React.Component<SubmissionNoticeProps, S
                 {/* Sponsor Time List */}
                 <tr id={"sponsorSkipNoticeMiddleRow" + this.state.idSuffix}
                     className="sponsorTimeMessagesRow"
-                    style={{maxHeight: (this.contentContainer().v.offsetHeight - 200) + "px"}}>
+                    style={{maxHeight: (getVideo()?.offsetHeight - 200) + "px"}}
+                    onMouseDown={(e) => e.stopPropagation()}>
                     <td style={{width: "100%"}}>
                         {this.getSponsorTimeMessages()}
                     </td>
@@ -187,6 +216,11 @@ class SubmissionNoticeComponent extends React.Component<SubmissionNoticeProps, S
     }
 
     submit(): void {
+        if (isCurrentTimeWrong()) {
+            alert(chrome.i18n.getMessage("submissionFailedServerSideAds"));
+            return;
+        }
+
         // save all items
         for (const ref of this.timeEditRefs) {
             ref.current.saveEditTimes();
@@ -211,17 +245,19 @@ class SubmissionNoticeComponent extends React.Component<SubmissionNoticeProps, S
             }
         }
 
-        this.props.callback();
-
-        this.cancel();
+        this.props.callback().then((success) => {
+            if (success) {
+                this.cancel();
+            }
+        });
     }
 
     sortSegments(): void {
         let sponsorTimesSubmitting = this.props.contentContainer().sponsorTimesSubmitting;
         sponsorTimesSubmitting = sponsorTimesSubmitting.sort((a, b) => a.segment[0] - b.segment[0]);
 
-        Config.config.unsubmittedSegments[this.props.contentContainer().sponsorVideoID] = sponsorTimesSubmitting;
-        Config.forceSyncUpdate("unsubmittedSegments");
+        Config.local.unsubmittedSegments[this.props.contentContainer().sponsorVideoID] = sponsorTimesSubmitting;
+        Config.forceLocalUpdate("unsubmittedSegments");
 
         this.forceUpdate();
     }
@@ -253,7 +289,7 @@ class SubmissionNoticeComponent extends React.Component<SubmissionNoticeProps, S
     categoryChangeListener(index: number, category: Category): void {
         const dialogWidth = this.noticeRef?.current?.getElement()?.current?.offsetWidth;
         if (category !== "chooseACategory" && Config.config.showCategoryGuidelines
-                && this.contentContainer().v.offsetWidth > dialogWidth * 2) {
+                && getVideo().offsetWidth > dialogWidth * 2) {
             const options = {
                 title:  chrome.i18n.getMessage(`category_${category}`),
                 textBoxes: getGuidelineInfo(category),

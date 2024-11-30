@@ -1,55 +1,34 @@
-/*
-This file is only ran by GitHub Actions in order to populate the Invidious instances list
+import { InvidiousInstance, monitor } from "./invidiousType"
 
-This file should not be shipped with the extension
-*/
-
-import { writeFile, existsSync } from 'fs';
-import { join } from 'path';
-
-// import file from https://api.invidious.io/instances.json
-if (!existsSync(join(__dirname, "data.json"))) {
-  process.exit(1);
-}
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore
-import * as data from "../ci/data.json";
-
-type instanceMap = {
-  name: string,
-  url: string,
-  dailyRatios: {ratio: string, label: string }[],
-  thirtyDayUptime: string
-}[]
+import * as data from "../ci/invidious_instances.json";
 
 // only https servers
-const mapped: instanceMap = data
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  .filter((i: any) => i[1]?.type === 'https')
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  .map((instance: any) => {
+const mapped = (data as InvidiousInstance[])
+  .filter((i) =>
+    i[1]?.type === "https"
+    && i[1]?.monitor?.enabled
+  )
+  .map((instance) => {
+    const monitor = instance[1].monitor as monitor;
     return {
       name: instance[0],
       url: instance[1].uri,
-      dailyRatios: instance[1].monitor.dailyRatios,
-      thirtyDayUptime: instance[1]?.monitor['30dRatio'].ratio,
+      uptime: monitor.uptime || 0,
+      down: monitor.down ?? false,
+      created_at: monitor.created_at,
     }
-  })
+  });
 
 // reliability and sanity checks
 const reliableCheck = mapped
-  .filter((instance) => {
-    // 30d uptime >= 90%
-    const thirtyDayUptime = Number(instance.thirtyDayUptime) >= 90
-    // available for at least 80/90 days
-    const dailyRatioCheck = instance.dailyRatios.filter(status => status.label !== "black")
-    return (thirtyDayUptime && dailyRatioCheck.length >= 80)
+  .filter(instance => {
+    const uptime = instance.uptime > 80 && !instance.down;
+    const nameIncluded = instance.url.includes(instance.name);
+    const ninetyDays = 90 * 24 * 60 * 60 * 1000;
+    const ninetyDaysAgo = new Date(Date.now() - ninetyDays);
+    const createdAt = new Date(instance.created_at).getTime() < ninetyDaysAgo.getTime();
+    return uptime && nameIncluded && createdAt;
   })
-  // url includes name
-  .filter(instance => instance.url.includes(instance.name))
 
-// finally map to array
-const result: string[] = reliableCheck.map(instance => instance.name).sort()
-writeFile(join(__dirname, "./invidiouslist.json"), JSON.stringify(result), (err) => {
-  if (err) return console.log(err);
-})
+export const getInvidiousList = (): string[] =>
+  reliableCheck.map(instance => instance.name).sort()

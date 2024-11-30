@@ -14,7 +14,7 @@
 }
 
 .sponsorSkipNoticeParent {
-	min-width: 350px;
+	min-width: 390px;
 	max-width: 50%;
 }
 
@@ -36,7 +36,7 @@
 	max-width: calc(100% - 50px);
 }
 
-.sponsorSkipNotice .hidden {
+.sponsorSkipNotice .sbhidden {
 	display: none;
 }
 
@@ -216,4 +216,17 @@
 
 	display: flex;
 	align-items: center;
+}
+
+/*
+ * Buttons that appear under a segment on click
+ */
+.voteButton {
+	height: 20px;
+	padding: 0 5px;
+	cursor: pointer;
+}
+
+.voteButton:hover {
+	opacity: 0.8;
 }
