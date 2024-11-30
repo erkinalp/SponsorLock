@@ -1,8 +1,7 @@
 import * as React from "react";
 import { createRoot } from 'react-dom/client';
 
-import Config from "./config";
-import * as CompileConfig from "../config.json";
+import Config, { generateDebugDetails } from "./config";
 import * as invidiousList from "../ci/invidiouslist.json";
 
 // Make the config public for debugging purposes
@@ -13,15 +12,23 @@ import CategoryChooser from "./render/CategoryChooser";
 import UnsubmittedVideos from "./render/UnsubmittedVideos";
 import KeybindComponent from "./components/options/KeybindComponent";
 import { showDonationLink } from "./utils/configUtils";
-import { localizeHtmlPage } from "./utils/pageUtils";
-import { StorageChangesObject } from "./types";
+import { localizeHtmlPage } from "../maze-utils/src/setup";
+import { StorageChangesObject } from "../maze-utils/src/config";
+import { getHash } from "../maze-utils/src/hash";
+import { isFirefoxOrSafari } from "../maze-utils/src";
+import { isDeArrowInstalled } from "./utils/crossExtension";
+import { asyncRequestToServer } from "./utils/requests";
 const utils = new Utils();
 let embed = false;
 
 const categoryChoosers: CategoryChooser[] = [];
 const unsubmittedVideos: UnsubmittedVideos[] = [];
 
-window.addEventListener('DOMContentLoaded', init);
+if (document.readyState === "complete") {
+    init();
+} else {
+    document.addEventListener("DOMContentLoaded", init);
+}
 
 async function init() {
     localizeHtmlPage();
@@ -54,6 +61,10 @@ async function init() {
         Config.configSyncListeners.push(optionsConfigUpdateListener);
     }
 
+    if (!Config.configLocalListeners.includes(optionsLocalConfigUpdateListener)) {
+        Config.configLocalListeners.push(optionsLocalConfigUpdateListener);
+    }
+
     await utils.wait(() => Config.config !== null);
 
     if (!Config.config.darkMode) {
@@ -65,6 +76,30 @@ async function init() {
     if (!showDonationLink()) {
         donate.classList.add("hidden");
     }
+
+    // DeArrow promotion
+    if (Config.config.showNewFeaturePopups && Config.config.showUpsells && Config.config.showDeArrowInSettings) {
+        isDeArrowInstalled().then((installed) => {
+            if (!installed) {
+                const deArrowPromotion = document.getElementById("deArrowPromotion");
+                deArrowPromotion.classList.remove("hidden");
+
+                deArrowPromotion.addEventListener("click", () => Config.config.showDeArrowPromotion = false);
+
+                const closeButton = deArrowPromotion.querySelector(".close-button");
+                closeButton.addEventListener("click", (e) => {
+                    e.preventDefault();
+                    
+                    deArrowPromotion.classList.add("hidden");
+                    Config.config.showDeArrowPromotion = false;
+                    Config.config.showDeArrowInSettings = false;
+                });
+            }
+        });
+    }
+
+    const skipToHighlightKeybind = document.querySelector(`[data-sync="skipToHighlightKeybind"] .optionLabel`) as HTMLElement;
+    skipToHighlightKeybind.innerText = `${chrome.i18n.getMessage("skip_to_category").replace("{0}", chrome.i18n.getMessage("category_poi_highlight")).replace("?", "")}:`;
 
     // Set all of the toggle options to the correct option
     const optionsContainer = document.getElementById("options");
@@ -185,7 +220,7 @@ async function init() {
                             }
 
                             // Permission needed on Firefox
-                            if (utils.isFirefox()) {
+                            if (isFirefoxOrSafari()) {
                                 const permissionSuccess = await new Promise((resolve) => {
                                     chrome.permissions.request({
                                         origins: [textChangeInput.value + "/"],
@@ -221,10 +256,10 @@ async function init() {
 
                 if (option == "*")  {
                     const downloadButton = optionsElements[i].querySelector(".download-button");
-                    downloadButton.addEventListener("click", downloadConfig);
+                    downloadButton.addEventListener("click", () => downloadConfig(optionsElements[i]));
 
                     const uploadButton = optionsElements[i].querySelector(".upload-button");
-                    uploadButton.addEventListener("change", (e) => uploadConfig(e));
+                    uploadButton.addEventListener("change", (e) => uploadConfig(e, optionsElements[i] as HTMLElement));
                 }
 
                 const privateTextChangeOption = optionsElements[i].getAttribute("data-sync");
@@ -250,7 +285,7 @@ async function init() {
                             break;
                         case "resetToDefault":
                             Config.resetToDefault();
-                            window.location.reload();
+                            setTimeout(() => window.location.reload(), 200);
                             break;
                     }
                 });
@@ -374,7 +409,11 @@ function optionsConfigUpdateListener(changes: StorageChangesObject) {
         for (const chooser of categoryChoosers) {
             chooser.update();
         }
-    } else if (changes.unsubmittedSegments) {
+    }
+}
+
+function optionsLocalConfigUpdateListener(changes: StorageChangesObject) {
+    if (changes.unsubmittedSegments) {
         for (const chooser of unsubmittedVideos) {
             chooser.update();
         }
@@ -430,7 +469,12 @@ function invidiousInstanceAddInit(element: HTMLElement, option: string) {
             let instanceList = Config.config[option];
             if (!instanceList) instanceList = [];
 
-            instanceList.push(textBox.value);
+            let domain = textBox.value.trim().toLowerCase();
+            if (domain.includes(":")) {
+                domain = domain.split(":")[0];
+            }
+
+            instanceList.push(domain);
 
             Config.config[option] = instanceList;
 
@@ -503,6 +547,7 @@ function activatePrivateTextChange(element: HTMLElement) {
 
     const textBox = <HTMLInputElement> element.querySelector(".option-text-box");
     const option = element.getAttribute("data-sync");
+    const optionType = element.getAttribute("data-sync-type");
 
     // See if anything extra must be done
     switch (option) {
@@ -515,7 +560,11 @@ function activatePrivateTextChange(element: HTMLElement) {
     // See if anything extra must be done
     switch (option) {
         case "*": {
-            result = JSON.stringify(Config.cachedSyncConfig);
+            if (optionType === "local") {
+                result = JSON.stringify(Config.cachedLocalStorage);
+            } else {
+                result = JSON.stringify(Config.cachedSyncConfig);
+            }
             break;
         }
     }
@@ -531,8 +580,8 @@ function activatePrivateTextChange(element: HTMLElement) {
     switch (option) {
         case "userID":
             if (Config.config[option]) {
-                utils.asyncRequestToServer("GET", "/api/userInfo", {
-                    userID: Config.config[option],
+                asyncRequestToServer("GET", "/api/userInfo", {
+                    publicUserID: getHash(Config.config[option]),
                     values: ["warnings", "banned"]
                 }).then((result) => {
                     const userInfo = JSON.parse(result.responseText);
@@ -558,6 +607,7 @@ function activatePrivateTextChange(element: HTMLElement) {
  */
 async function setTextOption(option: string, element: HTMLElement, value: string, callbackOnError?: () => void) {
     const confirmMessage = element.getAttribute("data-confirm-message");
+    const optionType = element.getAttribute("data-sync-type");
 
     if (confirmMessage === null || confirm(chrome.i18n.getMessage(confirmMessage))) {
 
@@ -567,18 +617,21 @@ async function setTextOption(option: string, element: HTMLElement, value: string
                 try {
                     const newConfig = JSON.parse(value);
                     for (const key in newConfig) {
-                        Config.config[key] = newConfig[key];
+                        if (optionType === "local") {
+                            Config.local[key] = newConfig[key];
+                        } else {
+                            Config.config[key] = newConfig[key];
+                        }
                     }
 
-                    if (newConfig.supportInvidious) {
+                    if (optionType !== "local" && newConfig.supportInvidious) {
                         const checkbox = <HTMLInputElement> document.querySelector("#support-invidious > div > label > input");
 
                         checkbox.checked = true;
                         await invidiousOnClick(checkbox, "supportInvidious");
                     }
 
-                    window.location.reload();
-
+                    setTimeout(() => window.location.reload(), 200);
                 } catch (e) {
                     alert(chrome.i18n.getMessage("incorrectlyFormattedOptions"));
                 }
@@ -593,25 +646,27 @@ async function setTextOption(option: string, element: HTMLElement, value: string
     }
 }
 
-function downloadConfig() {
+function downloadConfig(element: Element) {
+    const optionType = element.getAttribute("data-sync-type");
+
     const file = document.createElement("a");
-    const jsonData = JSON.parse(JSON.stringify(Config.cachedSyncConfig));
+    const jsonData = JSON.parse(JSON.stringify(optionType === "local" ? Config.cachedLocalStorage : Config.cachedSyncConfig));
     const dateTimeString = new Date().toJSON().replace("T", "_").replace(/:/g, ".").replace(/.\d+Z/g, "")
     file.setAttribute("href", `data:text/json;charset=utf-8,${encodeURIComponent(JSON.stringify(jsonData))}`);
-    file.setAttribute("download", `SponsorBlockConfig_${dateTimeString}.json`);
+    file.setAttribute("download", `SponsorBlock${optionType === "local" ? "OtherData" : "Config"}_${dateTimeString}.json`);
     document.body.append(file);
     file.click();
     file.remove();
 }
 
-function uploadConfig(e) {
-    if (e.target.files.length == 1) {
-        const file = e.target.files[0];
+function uploadConfig(e: Event, element: HTMLElement) {
+    const target = e.target as HTMLInputElement;
+    if (target.files.length == 1) {
+        const file = target.files[0];
         const reader = new FileReader();
-        const element = document.querySelector("[data-sync='*']") as HTMLElement;
         reader.onload = function(ev) {
             setTextOption("*", element, ev.target.result as string, () => {
-                e.target.value = null;
+                target.value = null;
             });
         };
         reader.readAsText(file);
@@ -642,32 +697,14 @@ function validateServerAddress(input: string): string {
 }
 
 function copyDebugOutputToClipboard() {
-    // Build output debug information object
-    const output = {
-        debug: {
-            userAgent: navigator.userAgent,
-            platform: navigator.platform,
-            language: navigator.language,
-            extensionVersion: chrome.runtime.getManifest().version
-        },
-        config: JSON.parse(JSON.stringify(Config.cachedSyncConfig)) // Deep clone config object
-    };
-
-    // Sanitise sensitive user config values
-    delete output.config.userID;
-    output.config.serverAddress = (output.config.serverAddress === CompileConfig.serverAddress)
-        ? "Default server address" : "Custom server address";
-    output.config.invidiousInstances = output.config.invidiousInstances.length;
-    output.config.whitelistedChannels = output.config.whitelistedChannels.length;
-
     // Copy object to clipboard
-    navigator.clipboard.writeText(JSON.stringify(output, null, 4))
-      .then(() => {
+    navigator.clipboard.writeText(generateDebugDetails())
+    .then(() => {
         alert(chrome.i18n.getMessage("copyDebugInformationComplete"));
-      })
-      .catch(() => {
+    })
+    .catch(() => {
         alert(chrome.i18n.getMessage("copyDebugInformationFailed"));
-      });
+    });
 }
 
 function isIncognitoAllowed(): Promise<boolean> {

@@ -27,7 +27,7 @@
   position: relative;
 }
 
-#sponsorBlockPopupBody .hidden {
+#sponsorBlockPopupBody .hidden, #sponsorBlockPopupBody .sbhidden {
   display: none !important;
 }
 
@@ -40,7 +40,7 @@
    color: var(--sb-main-fg-color);
    background: transparent;
    width: fit-content;
-   padding: none;
+   padding: 0;
    border: none;
  }
 
@@ -130,6 +130,7 @@
   top: 5px;
   right: 5px;
   opacity: 0.5;
+  z-index: 1;
 }
 
 .sbCloseButton:hover {
@@ -258,19 +259,6 @@
 
 .sbVoteButtonsContainer {
   text-align: right;
-}
-
-/*
- * Buttons that appear under a segment on click
- */
-.voteButton {
-  height: 20px;
-  padding: 0 5px;
-  cursor: pointer;
-}
-
-.voteButton:hover {
-  opacity: 0.8;
 }
 
 /*
@@ -498,6 +486,7 @@
 }
 #setUsernameContainer {
   display: flex;
+  align-items: center;
   width: fit-content;
 }
 #setUsernameContainer > button {
@@ -522,7 +511,7 @@
   white-space: nowrap;
   overflow: hidden;
   margin: 0 8px 0 0;
-  max-width: 130px;
+  max-width: 165px;
 }
 /*
  * Set username form container with "expanded" state

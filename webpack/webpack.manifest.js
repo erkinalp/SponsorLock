@@ -3,7 +3,6 @@
 const webpack = require("webpack");
 const path = require('path');
 const { validate } = require('schema-utils');
-
 const fs = require('fs');
 
 const manifest = require("../manifest/manifest.json");
@@ -12,6 +11,7 @@ const chromeManifestExtra = require("../manifest/chrome-manifest-extra.json");
 const safariManifestExtra = require("../manifest/safari-manifest-extra.json");
 const betaManifestExtra = require("../manifest/beta-manifest-extra.json");
 const firefoxBetaManifestExtra = require("../manifest/firefox-beta-manifest-extra.json");
+const manifestV2ManifestExtra = require("../manifest/manifest-v2-extra.json");
 
 // schema for options object
 const schema = {
@@ -42,12 +42,14 @@ class BuildManifest {
 
         // Add missing manifest elements
         if (this.options.browser.toLowerCase() === "firefox") {
+            mergeObjects(manifest, manifestV2ManifestExtra);
             mergeObjects(manifest, firefoxManifestExtra);
         } else if (this.options.browser.toLowerCase() === "chrome" 
                 || this.options.browser.toLowerCase() === "chromium"
                 || this.options.browser.toLowerCase() === "edge") {
             mergeObjects(manifest, chromeManifestExtra);
         }  else if (this.options.browser.toLowerCase() === "safari") {
+            mergeObjects(manifest, manifestV2ManifestExtra);
             mergeObjects(manifest, safariManifestExtra);
         }
 

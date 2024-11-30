@@ -1,5 +1,6 @@
 import * as React from "react";
 import Config from "../config";
+import SbSvg from "../svg-icons/sb_svg";
 
 enum CountdownMode {
     Timer,
@@ -18,6 +19,7 @@ export interface NoticeProps {
     idSuffix?: string;
 
     fadeIn?: boolean;
+    fadeOut?: boolean;
     startFaded?: boolean;
     firstColumn?: React.ReactElement[] | React.ReactElement;
     firstRow?: React.ReactElement;
@@ -28,6 +30,7 @@ export interface NoticeProps {
     extraClass?: string;
     hideLogo?: boolean;
     hideRightInfo?: boolean;
+    logoFill?: string;
 
     // Callback for when this is closed
     closeListener: () => void;
@@ -39,6 +42,13 @@ export interface NoticeProps {
     children?: React.ReactNode;
 }
 
+interface MouseDownInfo {
+    x: number;
+    y: number;
+    right: number;
+    bottom: number;
+}
+
 export interface NoticeState {
     maxCountdownTime: () => number;
 
@@ -48,7 +58,15 @@ export interface NoticeState {
     mouseHovering: boolean;
 
     startFaded: boolean;
+
+    mouseDownInfo: MouseDownInfo | null;
+    mouseMoved: boolean;
+    right: number;
+    bottom: number;
 }
+
+// Limits for dragging notice around
+const bounds = [10, 100, 10, 10];
 
 class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
     countdownInterval: NodeJS.Timeout;
@@ -58,6 +76,8 @@ class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
     amountOfPreviousNotices: number;
 
     parentRef: React.RefObject<HTMLDivElement>;
+
+    handleMouseMoveBinded: (e: MouseEvent) => void = this.handleMouseMove.bind(this);
 
     constructor(props: NoticeProps) {
         super(props);
@@ -85,7 +105,12 @@ class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
             countdownMode: CountdownMode.Timer,
             mouseHovering: false,
 
-            startFaded: this.props.startFaded ?? false
+            startFaded: this.props.startFaded ?? false,
+
+            mouseDownInfo: null,
+            mouseMoved: false,
+            right: bounds[0],
+            bottom: props.showInSecondSlot ? 290 : bounds[1]
         }
     }
 
@@ -96,6 +121,9 @@ class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
     render(): React.ReactElement {
         const noticeStyle: React.CSSProperties = {
             zIndex: this.props.zIndex || (1000 + this.amountOfPreviousNotices),
+            right: this.state.right,
+            bottom: this.state.bottom,
+            userSelect: this.state.mouseDownInfo && this.state.mouseMoved ? "none" : "auto",
             ...(this.props.style ?? {})
         }
 
@@ -105,7 +133,29 @@ class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
                     + (this.props.showInSecondSlot ? " secondSkipNotice" : "")
                     + (this.props.extraClass ? ` ${this.props.extraClass}` : "")}
                 onMouseEnter={(e) => this.onMouseEnter(e) }
-                onMouseLeave={() => this.timerMouseLeave()}
+                onMouseLeave={() => {
+                    this.timerMouseLeave();
+                }}
+                onMouseDown={(e) => {
+                    document.addEventListener("mousemove", this.handleMouseMoveBinded);
+
+                    this.setState({
+                        mouseDownInfo: {
+                            x: e.clientX,
+                            y: e.clientY,
+                            right: this.state.right,
+                            bottom: this.state.bottom
+                        },
+                        mouseMoved: false
+                    });
+                }}
+                onMouseUp={() => {
+                    document.removeEventListener("mousemove", this.handleMouseMoveBinded);
+
+                    this.setState({
+                        mouseDownInfo: null
+                    });
+                }}
                 ref={this.parentRef}
                 style={noticeStyle} >
                 <div className={"sponsorSkipNoticeTableContainer" 
@@ -122,10 +172,10 @@ class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
                                 <td className="noticeLeftIcon">
                                     {/* Logo */}
                                     {!this.props.hideLogo &&
-                                        <img id={"sponsorSkipLogo" + this.idSuffix} 
-                                            className="sponsorSkipLogo sponsorSkipObject"
-                                            src={chrome.extension.getURL("icons/IconSponsorBlocker256px.png")}>
-                                        </img>
+                                        <SbSvg
+                                            id={"sponsorSkipLogo" + this.idSuffix} 
+                                            fill={this.props.logoFill}
+                                            className="sponsorSkipLogo sponsorSkipObject"/>
                                     }
 
                                     <span id={"sponsorSkipMessage" + this.idSuffix}
@@ -158,7 +208,7 @@ class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
                                     
 
                                         {/* Close button */}
-                                        <img src={chrome.extension.getURL("icons/close.png")}
+                                        <img src={chrome.runtime.getURL("icons/close.png")}
                                             className={"sponsorSkipObject sponsorSkipNoticeButton sponsorSkipNoticeCloseButton sponsorSkipNoticeRightButton" 
                                                             + (this.props.biggerCloseButton ? " biggerCloseButton" : "")}
                                             onClick={() => this.close()}>
@@ -194,21 +244,21 @@ class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
                     <span 
                         id={"skipNoticeTimerText" + this.idSuffix}
                         key="skipNoticeTimerText"
-                        className={this.state.countdownMode !== CountdownMode.Timer ? "hidden" : ""} >
-                            {this.state.countdownTime + "s"}
+                        className={this.state.countdownMode !== CountdownMode.Timer ? "sbhidden" : ""} >
+                            {chrome.i18n.getMessage("NoticeTimeAfterSkip").replace("{seconds}", Math.ceil(this.state.countdownTime).toString())}
                     </span>
                 ),(
                     <img 
                         id={"skipNoticeTimerPaused" + this.idSuffix}
                         key="skipNoticeTimerPaused"
-                        className={this.state.countdownMode !== CountdownMode.Paused ? "hidden" : ""}
+                        className={this.state.countdownMode !== CountdownMode.Paused ? "sbhidden" : ""}
                         src={chrome.runtime.getURL("icons/pause.svg")}
                         alt={chrome.i18n.getMessage("paused")} />
                 ),(
                     <img 
                         id={"skipNoticeTimerStopped" + this.idSuffix}
                         key="skipNoticeTimerStopped"
-                        className={this.state.countdownMode !== CountdownMode.Stopped ? "hidden" : ""}
+                        className={this.state.countdownMode !== CountdownMode.Stopped ? "sbhidden" : ""}
                         src={chrome.runtime.getURL("icons/stop.svg")}
                         alt={chrome.i18n.getMessage("manualPaused")} />
         )];
@@ -277,7 +327,7 @@ class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
             return;
         }
 
-        if (countdownTime == 3) {
+        if (countdownTime == 3 && this.props.fadeOut) {
             //start fade out animation
             const notice = document.getElementById("sponsorSkipNotice" + this.idSuffix);
             notice?.style.removeProperty("animation");
@@ -392,6 +442,31 @@ class NoticeComponent extends React.Component<NoticeProps, NoticeState> {
 
     getElement(): React.RefObject<HTMLDivElement> {
         return this.parentRef;
+    }
+
+    componentWillUnmount(): void {
+        document.removeEventListener("mousemove", this.handleMouseMoveBinded);
+    }
+
+    // For dragging around notice
+    handleMouseMove(e: MouseEvent): void {
+        if (this.state.mouseDownInfo && e.buttons === 1) {
+            const [mouseX, mouseY] = [e.clientX, e.clientY];
+
+            const deltaX = mouseX - this.state.mouseDownInfo.x;
+            const deltaY = mouseY - this.state.mouseDownInfo.y;
+
+            if (deltaX > 0 || deltaY > 0) this.setState({ mouseMoved: true });
+
+            const element = this.parentRef.current;
+            const parent = element.parentElement.parentElement;
+            this.setState({
+                right: Math.min(parent.clientWidth - element.clientWidth - bounds[2], Math.max(bounds[0], this.state.mouseDownInfo.right - deltaX)),
+                bottom: Math.min(parent.clientHeight - element.clientHeight - bounds[3], Math.max(bounds[1], this.state.mouseDownInfo.bottom - deltaY))
+            });
+        } else {
+            document.removeEventListener("mousemove", this.handleMouseMoveBinded);
+        }
     }
 }
 

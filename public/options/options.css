@@ -38,7 +38,7 @@
     --white: black;
 }
 
-.medium-description, .switch-container, .optionLabel, .categoryTableElement {
+.medium-description, .switch-container, .optionLabel, .categoryTableElement, .promotion-description {
     color: var(--white);
 }
 
@@ -118,13 +118,13 @@ html, body {
 
 .option-group > div {
     min-height: 50px;
-    padding: 20px 0;
+    padding: 15px 0;
     border-bottom: 1px solid var(--border-color);
     border-image: linear-gradient(to right, var(--border-color), #00000000 80%)  1;
 }
 
 .categoryExtraOptions {
-    padding-bottom: 20px;
+    padding-bottom: 15px;
 }
 
 #music_offtopic_autoSkipOnMusicVideos {
@@ -257,7 +257,7 @@ input[type='number'] {
     opacity: 0;
 }
 
-.hidden {
+.hidden, .sbhidden {
     display: none !important;
 }
 
@@ -271,11 +271,11 @@ input[type='number'] {
 
 .small-description {
     font-size: 13px;
-    padding: 15px 0 0 20px;
+    padding: 5px 0 0 20px;
 }
 
 .small-description td {
-    padding: 10px 0 20px 20px;
+    padding: 2.5px 0 10px 20px;
 }
 
 .indent {
@@ -283,7 +283,7 @@ input[type='number'] {
 }
 
 .categoryTableElement td {
-    padding-top: 10px;
+    padding-top: 5px;
     border-top: 1px solid var(--border-color);
 }
 
@@ -353,7 +353,8 @@ input[type='number'] {
 
     font-size: 14px;
 
-    display: table;
+    display: flex;
+    align-items: center;
 }
 
 .switch-container .switch-label {
@@ -696,4 +697,37 @@ svg {
 .upsellButton {
     cursor: pointer;
     vertical-align: middle;
+}
+
+.no-bottom-border {
+    border: none !important;
+    padding: 20px 0px 0px 0px !important;
+}
+
+.promotion-container {
+    width: fit-content;
+}
+
+.dearrow-link {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+}
+
+.dearrow-link > img {
+    width: 40px;
+    margin-right: 4px;
+}
+
+.dearrow-link .close-button {
+    opacity: 0;
+    width: 15px;
+    filter: invert(0.3);
+    transition: opacity 0.2s;
+    margin-left: 10px;
+}
+  
+.dearrow-link:hover .close-button {
+    opacity: 1;
 }

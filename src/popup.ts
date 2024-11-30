@@ -1,4 +1,4 @@
-import Config from "./config";
+import Config, { generateDebugDetails } from "./config";
 
 import Utils from "./utils";
 import {
@@ -7,26 +7,29 @@ import {
     SponsorHideType,
     SponsorSourceType,
     SponsorTime,
-    StorageChangesObject,
 } from "./types";
 import {
     GetChannelIDResponse,
     IsChannelWhitelistedResponse,
     IsInfoFoundMessageResponse,
+    LogResponse,
     Message,
     MessageResponse,
     PopupMessage,
+    RefreshSegmentsResponse,
     SponsorStartResponse,
     VoteResponse,
 } from "./messageTypes";
 import { showDonationLink } from "./utils/configUtils";
-import { AnimationUtils } from "./utils/animationUtils";
-import { GenericUtils } from "./utils/genericUtils";
+import { AnimationUtils } from "../maze-utils/src/animationUtils";
 import { shortCategoryName } from "./utils/categoryUtils";
-import { localizeHtmlPage } from "./utils/pageUtils";
+import { localizeHtmlPage } from "../maze-utils/src/setup";
 import { exportTimes } from "./utils/exporter";
 import GenericNotice from "./render/GenericNotice";
-import { noRefreshFetchingChaptersAllowed } from "./utils/licenseKey";
+import { getErrorMessage, getFormattedTime } from "../maze-utils/src/formating";
+import { StorageChangesObject } from "../maze-utils/src/config";
+import { getHash } from "../maze-utils/src/hash";
+import { asyncRequestToServer, sendRequestToServer } from "./utils/requests";
 
 const utils = new Utils();
 
@@ -67,9 +70,17 @@ class MessageHandler {
 
 // To prevent clickjacking
 let allowPopup = window === window.top;
-window.addEventListener("message", async (e) => {
+window.addEventListener("message", async (e): Promise<void> => {
     if (e.source !== window.parent) return;
-    if (e.origin.endsWith('.youtube.com')) return allowPopup = true;
+    if (e.origin.endsWith('.youtube.com')) {
+        allowPopup = true;
+
+        if (e.data && e.data?.type === "style") {
+            const style = document.createElement("style");
+            style.textContent = e.data.css;
+            document.head.appendChild(style);
+        }
+    }
 });
 
 //make this a function to allow this to run on the content page
@@ -85,6 +96,8 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
     type PageElements = { [key: string]: HTMLElement } & InputPageElements
 
     let stopLoadingAnimation = null;
+    // For loading video info from the page
+    let loadRetryCount = 0;
 
     //the start and end time pairs (2d)
     let sponsorTimes: SponsorTime[] = [];
@@ -106,6 +119,10 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
     const PageElements: PageElements = {};
 
     [
+        "sbPopupLogo",
+        "sbYourWorkBox",
+        "videoInfo",
+        "sbFooter",
         "sponsorBlockPopupBody",
         "sponsorblockPopup",
         "sponsorStart",
@@ -168,7 +185,8 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
         "exportSegmentsButton",
         "importSegmentsMenu",
         "importSegmentsText",
-        "importSegmentsSubmit"
+        "importSegmentsSubmit",
+        "debugLogs"
 
     ].forEach(id => PageElements[id] = document.getElementById(id));
 
@@ -195,6 +213,16 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
         PageElements.sbDonate.style.display = "none";
     }
     PageElements.sbDonate.addEventListener("click", () => Config.config.donateClicked = Config.config.donateClicked + 1);
+
+    if (Config.config.cleanPopup) {
+        PageElements.sbPopupLogo.classList.add("hidden");
+        PageElements.sbYourWorkBox.classList.add("hidden");
+        PageElements.sbFooter.classList.add("hidden");
+        PageElements.sponsorTimesDonateContainer.classList.add("hidden");
+        PageElements.mainControls.classList.add("hidden");
+
+        PageElements.videoInfo.style.marginTop = "10px";
+    }
 
     if (Config.config.testingServer) {
         PageElements.sbBetaServerWarning.classList.remove("hidden");
@@ -228,7 +256,8 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
     PageElements.optionsButton.addEventListener("click", openOptions);
     PageElements.helpButton.addEventListener("click", openHelp);
     PageElements.refreshSegmentsButton.addEventListener("click", refreshSegments);
-    PageElements.sbPopupIconCopyUserID.addEventListener("click", async () => copyToClipboard(await utils.getHash(Config.config.userID)));
+    PageElements.sbPopupIconCopyUserID.addEventListener("click", async () => copyToClipboard(await getHash(Config.config.userID)));
+    PageElements.debugLogs.addEventListener("click", copyDebgLogs);
 
     // Forward click events
     if (window !== window.top) {
@@ -277,11 +306,10 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
         PageElements.showNoticeAgain.style.display = "unset";
     }
 
-    const values = ["userName", "viewCount", "minutesSaved", "vip", "permissions"];
-    if (!Config.config.payments.freeAccess && !noRefreshFetchingChaptersAllowed()) values.push("freeChaptersAccess");
+    const values = ["userName", "viewCount", "minutesSaved", "vip", "permissions", "segmentCount"];
 
-    utils.asyncRequestToServer("GET", "/api/userInfo", {
-        userID: Config.config.userID,
+    asyncRequestToServer("GET", "/api/userInfo", {
+        publicUserID: await getHash(Config.config.userID),
         values
     }).then((res) => {
         if (res.status === 200) {
@@ -311,23 +339,18 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
                 PageElements.sponsorTimesOthersTimeSavedDisplay.innerText = getFormattedHours(minutesSaved);
             }
 
+            //get the amount of times this user has contributed and display it to thank them
+            PageElements.sponsorTimesContributionsDisplay.innerText = Math.max(Config.config.sponsorTimesContributed ?? 0, userInfo.segmentCount).toLocaleString();
+            PageElements.sponsorTimesContributionsContainer.classList.remove("hidden");
+
+            PageElements.sponsorTimesOthersTimeSavedEndWord.innerText = chrome.i18n.getMessage("minsLower");
+
             Config.config.isVip = userInfo.vip;
             Config.config.permissions = userInfo.permissions;
-
-            if (userInfo.freeChaptersAccess) {
-                Config.config.payments.chaptersAllowed = userInfo.freeChaptersAccess;
-                Config.config.payments.freeAccess = userInfo.freeChaptersAccess;
-                Config.config.payments.lastCheck = Date.now();
-                Config.forceSyncUpdate("payments");
-            }
         }
     });
 
-    //get the amount of times this user has contributed and display it to thank them
-    if (Config.config.sponsorTimesContributed != undefined) {
-        PageElements.sponsorTimesContributionsDisplay.innerText = Config.config.sponsorTimesContributed.toLocaleString();
-        PageElements.sponsorTimesContributionsContainer.classList.remove("hidden");
-    }
+    
 
     //get the amount of times this user has skipped a sponsor
     if (Config.config.skipCount != undefined) {
@@ -394,9 +417,18 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
                 currentVideoID = result.videoID;
 
                 loadTabData(tabs, updating);
-            } else if (result === undefined && chrome.runtime.lastError) {
-                //this isn't a YouTube video then, or at least the content script is not loaded
+            } else {
+                // Handle error if it exists
+                chrome.runtime.lastError;
+
+                // This isn't a YouTube video then, or at least the content script is not loaded
                 displayNoVideo();
+
+                // Try again in some time if a failure
+                loadRetryCount++;
+                if (loadRetryCount < 6) {
+                    setTimeout(() => getSegmentsFromContentScript(false), 100 * loadRetryCount);
+                }
             }
         });
     }
@@ -409,7 +441,7 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
         }
 
         await utils.wait(() => Config.config !== null, 5000, 10);
-        sponsorTimes = Config.config.unsubmittedSegments[currentVideoID] ?? [];
+        sponsorTimes = Config.local.unsubmittedSegments[currentVideoID] ?? [];
         updateSegmentEditingUI();
 
         messageHandler.sendMessage(
@@ -433,37 +465,35 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
             stopLoadingAnimation = null;
         }
 
-        if (chrome.runtime.lastError) {
+        if (chrome.runtime.lastError || request == undefined || request.found == undefined) {
             //This page doesn't have the injected content script, or at least not yet
+            // Or if the request is empty, meaning the current page is not YouTube or a video page
             displayNoVideo();
             return;
         }
 
-        //if request is undefined, then the page currently being browsed is not YouTube
-        if (request != undefined) {
-            //remove loading text
-            PageElements.mainControls.style.display = "block";
-            if (request.onMobileYouTube) PageElements.mainControls.classList.add("hidden");
-            PageElements.whitelistButton.classList.remove("hidden");
-            PageElements.loadingIndicator.style.display = "none";
+        //remove loading text
+        PageElements.mainControls.style.display = "block";
+        if (request.onMobileYouTube) PageElements.mainControls.classList.add("hidden");
+        PageElements.whitelistButton.classList.remove("hidden");
+        PageElements.loadingIndicator.style.display = "none";
 
-            downloadedTimes = request.sponsorTimes ?? [];
-            displayDownloadedSponsorTimes(downloadedTimes, request.time);
-            if (request.found) {
-                PageElements.videoFound.innerHTML = chrome.i18n.getMessage("sponsorFound");
-                PageElements.issueReporterImportExport.classList.remove("hidden");
-            } else if (request.status == 404 || request.status == 200) {
-                PageElements.videoFound.innerHTML = chrome.i18n.getMessage("sponsor404");
-                PageElements.issueReporterImportExport.classList.remove("hidden");
+        downloadedTimes = request.sponsorTimes ?? [];
+        displayDownloadedSponsorTimes(downloadedTimes, request.time);
+        if (request.found) {
+            PageElements.videoFound.innerHTML = chrome.i18n.getMessage("sponsorFound");
+            PageElements.issueReporterImportExport.classList.remove("hidden");
+        } else if (request.status == 404 || request.status == 200) {
+            PageElements.videoFound.innerHTML = chrome.i18n.getMessage("sponsor404");
+            PageElements.issueReporterImportExport.classList.remove("hidden");
+        } else {
+            if (request.status) {
+                PageElements.videoFound.innerHTML = chrome.i18n.getMessage("connectionError") + request.status;
             } else {
-                if (request.status) {
-                    PageElements.videoFound.innerHTML = chrome.i18n.getMessage("connectionError") + request.status;
-                } else {
-                    PageElements.videoFound.innerHTML = chrome.i18n.getMessage("segmentsStillLoading");
-                }
-                
-                PageElements.issueReporterImportExport.classList.remove("hidden");
+                PageElements.videoFound.innerHTML = chrome.i18n.getMessage("segmentsStillLoading");
             }
+
+            PageElements.issueReporterImportExport.classList.remove("hidden");
         }
 
         //see if whitelist button should be swapped
@@ -501,7 +531,7 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
     function startSponsorCallback(response: SponsorStartResponse) {
         // Only update the segments after a segment was created
         if (!response.creatingSegment) {
-            sponsorTimes = Config.config.unsubmittedSegments[currentVideoID] || [];
+            sponsorTimes = Config.local.unsubmittedSegments[currentVideoID] || [];
         }
 
         // Update the UI
@@ -536,7 +566,7 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
                     return true;
                 }
             })
-            .sort((a, b) => a.segment[1] - b.segment[1])
+            .sort((a, b) => b.segment[1] - a.segment[1])
             .sort((a, b) => a.segment[0] - b.segment[0]);
 
         //add them as buttons to the issue reporting container
@@ -591,9 +621,9 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
             if (downloadedTimes[i].actionType === ActionType.Full) {
                 segmentTimeFromToNode.innerText = chrome.i18n.getMessage("full");
             } else {
-                segmentTimeFromToNode.innerText = GenericUtils.getFormattedTime(downloadedTimes[i].segment[0], true) +
+                segmentTimeFromToNode.innerText = getFormattedTime(downloadedTimes[i].segment[0], true) +
                         (actionType !== ActionType.Poi
-                            ? " " + chrome.i18n.getMessage("to") + " " + GenericUtils.getFormattedTime(downloadedTimes[i].segment[1], true)
+                            ? " " + chrome.i18n.getMessage("to") + " " + getFormattedTime(downloadedTimes[i].segment[1], true)
                             : "");
             }
 
@@ -614,6 +644,7 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
             const votingButtons = document.createElement("details");
             votingButtons.classList.add("votingButtons");
             votingButtons.id = "votingButtons" + UUID;
+            votingButtons.setAttribute("data-uuid", UUID);
             votingButtons.addEventListener("toggle", () => {
                 if (votingButtons.open) {
                     openedUUIDs.push(UUID);
@@ -692,12 +723,15 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
                 : chrome.i18n.getMessage("skipSegment");
             skipButton.addEventListener("click", () => skipSegment(actionType, UUID, skipButton));
             votingButtons.addEventListener("dblclick", () => skipSegment(actionType, UUID));
+            votingButtons.addEventListener("dblclick", () => skipSegment(actionType, UUID));
+            votingButtons.addEventListener("mouseenter", () => selectSegment(UUID));
 
             //add thumbs up, thumbs down and uuid copy buttons to the container
             voteButtonsContainer.appendChild(upvoteButton);
             voteButtonsContainer.appendChild(downvoteButton);
             voteButtonsContainer.appendChild(uuidButton);
             if (downloadedTimes[i].actionType === ActionType.Skip || downloadedTimes[i].actionType === ActionType.Mute
+                    || downloadedTimes[i].actionType === ActionType.Poi
                     && [SponsorHideType.Visible, SponsorHideType.Hidden].includes(downloadedTimes[i].hidden)) {
                 voteButtonsContainer.appendChild(hideButton);
             }
@@ -722,6 +756,8 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
 
             container.appendChild(votingButtons);
         }
+
+        container.addEventListener("mouseleave", () => selectSegment(null));
     }
 
     function submitTimes() {
@@ -737,7 +773,7 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
     }
 
     function isCreatingSegment(): boolean {
-        const segments = Config.config.unsubmittedSegments[currentVideoID];
+        const segments = Config.local.unsubmittedSegments[currentVideoID];
         if (!segments) return false;
         const lastSegment = segments[segments.length - 1];
         return lastSegment && lastSegment?.segment?.length !== 2;
@@ -804,7 +840,7 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
         PageElements.setUsernameStatus.style.display = "unset";
         PageElements.setUsernameStatus.innerText = chrome.i18n.getMessage("Loading");
 
-        utils.sendRequestToServer("POST", "/api/setUsername?userID=" + Config.config.userID + "&username=" + PageElements.usernameInput.value, function (response) {
+        sendRequestToServer("POST", "/api/setUsername?userID=" + Config.config.userID + "&username=" + PageElements.usernameInput.value, function (response) {
             if (response.status == 200) {
                 //submitted
                 PageElements.submitUsername.style.display = "none";
@@ -818,7 +854,7 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
 
                 PageElements.sponsorTimesContributionsContainer.classList.remove("hidden");
             } else {
-                PageElements.setUsernameStatus.innerText = GenericUtils.getErrorMessage(response.status, response.responseText);
+                PageElements.setUsernameStatus.innerText = getErrorMessage(response.status, response.responseText);
             }
         });
 
@@ -871,7 +907,7 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
                 //success (treat rate limits as a success)
                 addVoteMessage(chrome.i18n.getMessage("voted"), UUID);
             } else if (response.successType == -1) {
-                addVoteMessage(GenericUtils.getErrorMessage(response.statusCode, response.responseText), UUID);
+                addVoteMessage(getErrorMessage(response.statusCode, response.responseText), UUID);
             }
             setTimeout(() => removeVoteMessage(UUID), 1500);
         }
@@ -948,9 +984,17 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
         stopLoadingAnimation = AnimationUtils.applyLoadingAnimation(PageElements.refreshSegmentsButton, 0.3);
     }
 
-    function refreshSegments() {
+    async function refreshSegments() {
         startLoadingAnimation();
-        sendTabMessage({ message: 'refreshSegments' });
+        const response = await sendTabMessageAsync({ message: 'refreshSegments' }) as RefreshSegmentsResponse;
+
+        if (response == null || !response.hasVideo) {
+            if (stopLoadingAnimation != null) {
+                stopLoadingAnimation();
+                stopLoadingAnimation = null;
+            }
+            displayNoVideo();
+        }
     }
 
     function skipSegment(actionType: ActionType, UUID: SegmentUUID, element?: HTMLElement): void {
@@ -970,6 +1014,13 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
             const stopAnimation = AnimationUtils.applyLoadingAnimation(element, 0.3);
             stopAnimation();
         }
+    }
+
+    function selectSegment(UUID: SegmentUUID | null): void {
+        sendTabMessage({
+            message: "selectSegment",
+            UUID: UUID
+        });
     }
 
     /**
@@ -1045,16 +1096,17 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
      */
     function getFormattedHours(minutes) {
         minutes = Math.round(minutes * 10) / 10;
-        const days = Math.floor(minutes / 1440);
+        const years = Math.floor(minutes / 525600); // Assumes 365.0 days in a year
+        const days = Math.floor(minutes / 1440) % 365;
         const hours = Math.floor(minutes / 60) % 24;
-        return (days > 0 ? days + chrome.i18n.getMessage("dayAbbreviation") + " " : "") + (hours > 0 ? hours + chrome.i18n.getMessage("hourAbbreviation") + " " : "") + (minutes % 60).toFixed(1);
+        return (years > 0 ? years + chrome.i18n.getMessage("yearAbbreviation") + " " : "") + (days > 0 ? days + chrome.i18n.getMessage("dayAbbreviation") + " " : "") + (hours > 0 ? hours + chrome.i18n.getMessage("hourAbbreviation") + " " : "") + (minutes % 60).toFixed(1);
     }
 
     function contentConfigUpdateListener(changes: StorageChangesObject) {
         for (const key in changes) {
             switch(key) {
                 case "unsubmittedSegments":
-                    sponsorTimes = Config.config.unsubmittedSegments[currentVideoID] ?? [];
+                    sponsorTimes = Config.local.unsubmittedSegments[currentVideoID] ?? [];
                     updateSegmentEditingUI();
                     break;
             }
@@ -1067,17 +1119,50 @@ async function runThePopup(messageListener?: MessageListener): Promise<void> {
         port.onMessage.addListener((msg) => onMessage(msg));
     }
 
+    function updateCurrentTime(currentTime: number) {
+        // Create a map of segment UUID -> segment object for easy access
+        const segmentMap: Record<string, SponsorTime> = {};
+        for (const segment of downloadedTimes)
+            segmentMap[segment.UUID] = segment
+
+        // Iterate over segment elements and update their classes
+        const segmentList = document.getElementById("issueReporterTimeButtons");
+        for (const segmentElement of segmentList.children) {
+            const UUID = segmentElement.getAttribute("data-uuid");
+            if (UUID == null || segmentMap[UUID] == undefined) continue;
+
+            const summaryElement = segmentElement.querySelector("summary")
+            if (summaryElement == null) continue;
+
+            const segment = segmentMap[UUID]
+            summaryElement.classList.remove("segmentActive", "segmentPassed")
+            if (currentTime >= segment.segment[0]) {
+                if (currentTime < segment.segment[1]) {
+                    summaryElement.classList.add("segmentActive");
+                } else {
+                    summaryElement.classList.add("segmentPassed");
+                }
+            }
+        }
+    }
+
+    function copyDebgLogs() {
+        sendTabMessage({ message: "getLogs" }, (logs: LogResponse) => {
+            copyToClipboard(`${generateDebugDetails()}\n\nWarn:\n${logs.warn.join("\n")}\n\nDebug:\n${logs.debug.join("\n")}`);
+        });
+    }
+
     function onMessage(msg: PopupMessage) {
         switch (msg.message) {
             case "time":
-                displayDownloadedSponsorTimes(downloadedTimes, msg.time);
+                updateCurrentTime(msg.time);
                 break;
             case "infoUpdated":
                 infoFound(msg);
                 break;
             case "videoChanged":
                 currentVideoID = msg.videoID
-                sponsorTimes = Config.config.unsubmittedSegments[currentVideoID] ?? [];
+                sponsorTimes = Config.local.unsubmittedSegments[currentVideoID] ?? [];
                 updateSegmentEditingUI();
 
                 if (msg.whitelisted) {

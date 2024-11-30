@@ -1,8 +1,7 @@
 import * as React from "react";
 import { ChangeEvent } from "react";
 import Config from "../../config";
-import { Keybind } from "../../types";
-import { keybindEquals, formatKey } from "../../utils/configUtils";
+import { Keybind, formatKey, keybindEquals } from "../../../maze-utils/src/config";
 
 export interface KeybindDialogProps { 
     option: string;
@@ -124,7 +123,7 @@ class KeybindDialogComponent extends React.Component<KeybindDialogProps, Keybind
         let youtubeShortcuts: Keybind[];
         if (/[a-zA-Z0-9,.+\-\][:]/.test(this.state.key.key)) {
             youtubeShortcuts = [{key: "k"}, {key: "j"}, {key: "l"}, {key: "p", shift: true}, {key: "n", shift: true}, {key: ","}, {key: "."}, {key: ",", shift: true}, {key: ".", shift: true},
-                {key: "ArrowRight"}, {key: "ArrowLeft"}, {key: "ArrowUp"}, {key: "ArrowDown"}, {key: "ArrowRight", ctrl: true}, {key: "ArrowLeft", ctrl: true}, {key: "c"}, {key: "o"},
+                {key: "ArrowRight"}, {key: "ArrowLeft"}, {key: "ArrowUp"}, {key: "ArrowDown"}, {key: "c"}, {key: "o"},
                 {key: "w"}, {key: "+"}, {key: "-"}, {key: "f"}, {key: "t"}, {key: "i"}, {key: "m"}, {key: "a"}, {key: "s"}, {key: "d"}, {key: "Home"}, {key: "End"},
                 {key: "0"}, {key: "1"}, {key: "2"}, {key: "3"}, {key: "4"}, {key: "5"}, {key: "6"}, {key: "7"}, {key: "8"}, {key: "9"}, {key: "]"}, {key: "["}];
         } else {
@@ -142,9 +141,12 @@ class KeybindDialogComponent extends React.Component<KeybindDialogProps, Keybind
                 return {message: chrome.i18n.getMessage("youtubeKeybindWarning"), blocking: false};
         }
 
-        if (this.props.option != "skipKeybind" && this.equals(Config.config['skipKeybind']) ||
-                this.props.option != "submitKeybind" && this.equals(Config.config['submitKeybind']) ||
-                this.props.option != "startSponsorKeybind" && this.equals(Config.config['startSponsorKeybind']))
+        if (this.props.option !== "skipKeybind" && this.equals(Config.config['skipKeybind']) ||
+                this.props.option !== "submitKeybind" && this.equals(Config.config['submitKeybind']) ||
+                this.props.option !== "actuallySubmitKeybind" && this.equals(Config.config['actuallySubmitKeybind']) ||
+                this.props.option !== "previewKeybind" && this.equals(Config.config['previewKeybind']) ||
+                this.props.option !== "closeSkipNoticeKeybind" && this.equals(Config.config['closeSkipNoticeKeybind']) ||
+                this.props.option !== "startSponsorKeybind" && this.equals(Config.config['startSponsorKeybind']))
             return {message: chrome.i18n.getMessage("keyAlreadyUsed"), blocking: true};
 
         return null;

@@ -17,7 +17,8 @@ interface DefaultMessage {
         | "isChannelWhitelisted"
         | "submitTimes"
         | "refreshSegments"
-        | "closePopup";
+        | "closePopup"
+        | "getLogs";
 }
 
 interface BoolValueMessage {
@@ -31,7 +32,7 @@ interface IsInfoFoundMessage {
 }
 
 interface SkipMessage {
-    message: "unskip" | "reskip";
+    message: "unskip" | "reskip" | "selectSegment";
     UUID: SegmentUUID;
 }
 
@@ -103,7 +104,9 @@ export type MessageResponse =
     | IsChannelWhitelistedResponse
     | Record<string, never> // empty object response {}
     | VoteResponse
-    | ImportSegmentsResponse;
+    | ImportSegmentsResponse
+    | RefreshSegmentsResponse
+    | LogResponse;
 
 export interface VoteResponse {
     successType: number;
@@ -113,6 +116,15 @@ export interface VoteResponse {
 
 interface ImportSegmentsResponse {
     importedSegments: SponsorTime[];
+}
+
+export interface RefreshSegmentsResponse {
+    hasVideo: boolean;
+}
+
+export interface LogResponse {
+    debug: string[];
+    warn: string[];
 }
 
 export interface TimeUpdateMessage {

@@ -1,9 +1,9 @@
+import { objectToURI } from "../../maze-utils/src";
+import { getHash } from "../../maze-utils/src/hash";
 import Config from "../config";
 import GenericNotice, { NoticeOptions } from "../render/GenericNotice";
 import { ContentContainer } from "../types";
-import Utils from "../utils";
-import { GenericUtils } from "./genericUtils";
-const utils = new Utils();
+import { asyncRequestToServer } from "./requests";
 
 export interface ChatConfig {
     displayName: string;
@@ -12,20 +12,20 @@ export interface ChatConfig {
 }
 
 export async function openWarningDialog(contentContainer: ContentContainer): Promise<void> {
-    const userInfo = await utils.asyncRequestToServer("GET", "/api/userInfo", {
-        userID: Config.config.userID,
+    const userInfo = await asyncRequestToServer("GET", "/api/userInfo", {
+        publicUserID: await getHash(Config.config.userID),
         values: ["warningReason"]
     });
 
     if (userInfo.ok) {
         const warningReason = JSON.parse(userInfo.responseText)?.warningReason;
-        const userNameData = await utils.asyncRequestToServer("GET", "/api/getUsername?userID=" + Config.config.userID);
+        const userNameData = await asyncRequestToServer("GET", "/api/getUsername?userID=" + Config.config.userID);
         const userName = userNameData.ok ? JSON.parse(userNameData.responseText).userName : "";
-        const publicUserID = await utils.getHash(Config.config.userID);
+        const publicUserID = await getHash(Config.config.userID);
 
         let notice: GenericNotice = null;
         const options: NoticeOptions = {
-            title: chrome.i18n.getMessage("warningTitle"),
+            title: chrome.i18n.getMessage("deArrowMessageRecieved"),
             textBoxes: [{
                 text: chrome.i18n.getMessage("warningChatInfo"),
                 icon: null
@@ -42,7 +42,7 @@ export async function openWarningDialog(contentContainer: ContentContainer): Pro
                 {
                     name: chrome.i18n.getMessage("warningConfirmButton"),
                     listener: async () => {
-                        const result = await utils.asyncRequestToServer("POST", "/api/warnUser", {
+                        const result = await asyncRequestToServer("POST", "/api/warnUser", {
                             userID: Config.config.userID,
                             enabled: false
                         });
@@ -62,5 +62,5 @@ export async function openWarningDialog(contentContainer: ContentContainer): Pro
 }
 
 export function openChat(config: ChatConfig): void {
-    window.open("https://chat.sponsor.ajay.app/#" + GenericUtils.objectToURI("", config, false));
+    window.open("https://chat.sponsor.ajay.app/#" + objectToURI("", config, false));
 }

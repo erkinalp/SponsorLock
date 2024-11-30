@@ -6,16 +6,12 @@ import {
     ChannelIDInfo,
     ChannelIDStatus,
     ContentContainer,
-    HashedValue,
-    Keybind,
-    PageType,
     ScheduledTime,
     SegmentUUID,
     SkipToTimeParams,
     SponsorHideType,
     SponsorSourceType,
     SponsorTime,
-    StorageChangesObject,
     ToggleSkippable,
     VideoID,
     VideoInfo,
@@ -24,57 +20,84 @@ import Utils from "./utils";
 import PreviewBar, { PreviewBarSegment } from "./js-components/previewBar";
 import SkipNotice from "./render/SkipNotice";
 import SkipNoticeComponent from "./components/SkipNoticeComponent";
+import UpcomingNotice from "./render/UpcomingNotice";
 import SubmissionNotice from "./render/SubmissionNotice";
 import { Message, MessageResponse, VoteResponse } from "./messageTypes";
 import { SkipButtonControlBar } from "./js-components/skipButtonControlBar";
 import { getStartTimeFromUrl } from "./utils/urlParser";
-import { findValidElement, getControls, getExistingChapters, getHashParams, isVisible } from "./utils/pageUtils";
-import { isSafari, keybindEquals } from "./utils/configUtils";
+import { getControls, getExistingChapters, getHashParams, isPlayingPlaylist, isVisible } from "./utils/pageUtils";
 import { CategoryPill } from "./render/CategoryPill";
-import { AnimationUtils } from "./utils/animationUtils";
+import { AnimationUtils } from "../maze-utils/src/animationUtils";
 import { GenericUtils } from "./utils/genericUtils";
-import { logDebug } from "./utils/logger";
+import { logDebug, logWarn } from "./utils/logger";
 import { importTimes } from "./utils/exporter";
 import { ChapterVote } from "./render/ChapterVote";
 import { openWarningDialog } from "./utils/warnings";
-import { Tooltip } from "./render/Tooltip";
-import { noRefreshFetchingChaptersAllowed } from "./utils/licenseKey";
+import { isFirefoxOrSafari, waitFor } from "../maze-utils/src";
+import { getErrorMessage, getFormattedTime } from "../maze-utils/src/formating";
+import { getChannelIDInfo, getVideo, getIsAdPlaying, getIsLivePremiere, setIsAdPlaying, checkVideoIDChange, getVideoID, getYouTubeVideoID, setupVideoModule, checkIfNewVideoID, isOnInvidious, isOnMobileYouTube, getLastNonInlineVideoID, triggerVideoIDChange, triggerVideoElementChange, getIsInline, getCurrentTime, setCurrentTime, getVideoDuration, verifyCurrentTime, waitForVideo } from "../maze-utils/src/video";
+import { Keybind, StorageChangesObject, isSafari, keybindEquals, keybindToString } from "../maze-utils/src/config";
+import { findValidElement } from "../maze-utils/src/dom"
+import { getHash, HashedValue } from "../maze-utils/src/hash";
+import { generateUserID } from "../maze-utils/src/setup";
+import { updateAll } from "../maze-utils/src/thumbnailManagement";
+import { setupThumbnailListener } from "./utils/thumbnails";
+import * as documentScript from "../dist/js/document.js";
+import { runCompatibilityChecks } from "./utils/compatibility";
+import { cleanPage } from "./utils/pageCleaner";
+import { addCleanupListener } from "../maze-utils/src/cleanup";
+import { hideDeArrowPromotion, tryShowingDeArrowPromotion } from "./dearrowPromotion";
+import { asyncRequestToServer } from "./utils/requests";
+import { isMobileControlsOpen } from "./utils/mobileUtils";
+import { defaultPreviewTime } from "./utils/constants";
+import { onVideoPage } from "../maze-utils/src/pageInfo";
+import { getSegmentsForVideo } from "./utils/segmentData";
+
+cleanPage();
 
 const utils = new Utils();
 
-// Hack to get the CSS loaded on permission-based sites (Invidious)
-utils.wait(() => Config.config !== null, 5000, 10).then(addCSS);
+utils.wait(() => Config.isReady(), 5000, 10).then(() => {
+    // Hack to get the CSS loaded on permission-based sites (Invidious)
+    addCSS();
+    setCategoryColorCSSVariables();
+
+    runCompatibilityChecks();
+});
+
+const skipBuffer = 0.003;
+// If this close to the end, skip to the end
+const endTimeSkipBuffer = 0.5;
 
 //was sponsor data found when doing SponsorsLookup
 let sponsorDataFound = false;
 //the actual sponsorTimes if loaded and UUIDs associated with them
 let sponsorTimes: SponsorTime[] = [];
 let existingChaptersImported = false;
-//what video id are these sponsors for
-let sponsorVideoID: VideoID = null;
+let importingChaptersWaitingForFocus = false;
+let importingChaptersWaiting = false;
 // List of open skip notices
 const skipNotices: SkipNotice[] = [];
+let upcomingNotice: UpcomingNotice | null = null;
 let activeSkipKeybindElement: ToggleSkippable = null;
 let retryFetchTimeout: NodeJS.Timeout = null;
 let shownSegmentFailedToFetchWarning = false;
+let selectedSegment: SegmentUUID | null = null;
+let previewedSegment = false;
 
 // JSON video info
 let videoInfo: VideoInfo = null;
-// Page Type - browse/watch etc...
-let pageType: PageType;
-// if video is live or premiere
-let isLivePremiere: boolean
-// The channel this video is about
-let channelIDInfo: ChannelIDInfo;
 // Locked Categories in this tab, like: ["sponsor","intro","outro"]
 let lockedCategories: Category[] = [];
 // Used to calculate a more precise "virtual" video time
-let lastKnownVideoTime: { videoTime: number; preciseTime: number } = {
+const lastKnownVideoTime: { videoTime: number; preciseTime: number; fromPause: boolean; approximateDelay: number } = {
     videoTime: null,
-    preciseTime: null
+    preciseTime: null,
+    fromPause: false,
+    approximateDelay: null,
 };
 // It resumes with a slightly later time on chromium
-let lastTimeFromWaitingEvent = null;
+let lastTimeFromWaitingEvent: number = null;
 const lastNextChapterKeybind = {
     time: 0,
     date: 0
@@ -85,25 +108,31 @@ const lastNextChapterKeybind = {
 // Skips are canceled every seeking event
 let currentSkipSchedule: NodeJS.Timeout = null;
 let currentSkipInterval: NodeJS.Timeout = null;
+let currentVirtualTimeInterval: NodeJS.Timeout = null;
+let currentUpcomingSchedule: NodeJS.Timeout = null;
 
 /** Has the sponsor been skipped */
 let sponsorSkipped: boolean[] = [];
 
-//the video
-let video: HTMLVideoElement;
 let videoMuted = false; // Has it been attempted to be muted
-let videoMutationObserver: MutationObserver = null;
-let waitingForNewVideo = false;
-// List of videos that have had event listeners added to them
-const videosWithEventListeners: HTMLVideoElement[] = [];
-const controlsWithEventListeners: HTMLElement[] = []
+const controlsWithEventListeners: HTMLElement[] = [];
 
-// This misleading variable name will be fixed soon
-let onInvidious: boolean;
-let onMobileYouTube: boolean;
-
-//the video id of the last preview bar update
-let lastPreviewBarUpdate: VideoID;
+setupVideoModule({
+    videoIDChange,
+    channelIDChange,
+    videoElementChange,
+    playerInit: () => {
+        previewBar = null; // remove old previewbar
+        createPreviewBar();
+    },
+    updatePlayerBar: () => {
+        updatePreviewBar();
+        updateVisibilityOfPlayerControlsButton();
+    },
+    resetValues,
+    documentScript: chrome.runtime.getManifest().manifest_version === 2 ? documentScript : undefined
+}, () => Config);
+setupThumbnailListener();
 
 // Is the video currently being switched
 let switchingVideos = null;
@@ -112,6 +141,9 @@ let switchingVideos = null;
 // called at the same time
 let lastCheckTime = 0;
 let lastCheckVideoTime = -1;
+
+// To determine if a video resolution change is happening
+let firstPlay = true;
 
 //is this channel whitelised from getting sponsors skipped
 let channelWhitelisted = false;
@@ -128,13 +160,6 @@ let controls: HTMLElement | null = null;
 /** Contains buttons created by `createButton()`. */
 const playerButtons: Record<string, {button: HTMLButtonElement; image: HTMLImageElement; setupListener: boolean}> = {};
 
-// Direct Links after the config is loaded
-utils.wait(() => Config.config !== null, 1000, 1).then(() => videoIDChange(getYouTubeVideoID(document)));
-// wait for hover preview to appear, and refresh attachments if ever found
-utils.waitForElement(".ytp-inline-preview-ui").then(() => refreshVideoAttachments());
-utils.waitForElement("a.ytp-title-link[data-sessionlink='feature=player-title']")
-    .then(() => videoIDChange(getYouTubeVideoID(document)));
-addPageListeners();
 addHotkeyListener();
 
 /** Segments created by the user which have not yet been submitted. */
@@ -147,9 +172,6 @@ let popupInitialised = false;
 
 let submissionNotice: SubmissionNotice = null;
 
-// If there is an advert playing (or about to be played), this is true
-let isAdPlaying = false;
-
 let lastResponseStatus: number;
 let retryCount = 0;
 
@@ -161,11 +183,10 @@ const skipNoticeContentContainer: ContentContainer = () => ({
     sponsorTimes,
     sponsorTimesSubmitting,
     skipNotices,
-    v: video,
-    sponsorVideoID,
+    sponsorVideoID: getVideoID(),
     reskipSponsorTime,
     updatePreviewBar,
-    onMobileYouTube,
+    onMobileYouTube: isOnMobileYouTube(),
     sponsorSubmissionNotice: submissionNotice,
     resetSponsorSubmissionNotice,
     updateEditButtonsOnPlayer,
@@ -173,7 +194,7 @@ const skipNoticeContentContainer: ContentContainer = () => ({
     videoInfo,
     getRealCurrentTime: getRealCurrentTime,
     lockedCategories,
-    channelIDInfo
+    channelIDInfo: getChannelIDInfo()
 });
 
 // value determining when to count segment as skipped and send telemetry to server (percent based)
@@ -186,7 +207,7 @@ function messageListener(request: Message, sender: unknown, sendResponse: (respo
     //messages from popup script
     switch(request.message){
         case "update":
-            videoIDChange(getYouTubeVideoID(document));
+            checkVideoIDChange();
             break;
         case "sponsorStart":
             startOrEndTimingNewSegment()
@@ -202,8 +223,8 @@ function messageListener(request: Message, sender: unknown, sendResponse: (respo
                 found: sponsorDataFound,
                 status: lastResponseStatus,
                 sponsorTimes: sponsorTimes,
-                time: video.currentTime,
-                onMobileYouTube
+                time: getCurrentTime() ?? 0,
+                onMobileYouTube: isOnMobileYouTube()
             });
 
             if (!request.updating && popupInitialised && document.getElementById("sponsorBlockPopupContainer") != null) {
@@ -215,13 +236,13 @@ function messageListener(request: Message, sender: unknown, sendResponse: (respo
             break;
         case "getVideoID":
             sendResponse({
-                videoID: sponsorVideoID,
+                videoID: getVideoID(),
             });
 
             break;
         case "getChannelID":
             sendResponse({
-                channelID: channelIDInfo.id
+                channelID: getChannelIDInfo().id
             });
 
             break;
@@ -237,13 +258,20 @@ function messageListener(request: Message, sender: unknown, sendResponse: (respo
 
             break;
         case "submitTimes":
-            submitSponsorTimes();
+            openSubmissionMenu();
             break;
         case "refreshSegments":
             // update video on refresh if videoID invalid
-            if (!sponsorVideoID) videoIDChange(getYouTubeVideoID(document));
+            if (!getVideoID()) {
+                checkVideoIDChange();
+            }
+            // if popup rescieves no response, or the videoID is invalid,
+            // it will assume the page is not a video page and stop the refresh animation
+            sendResponse({ hasVideo: getVideoID() != null });
             // fetch segments
-            sponsorsLookup(false);
+            if (getVideoID()) {
+                sponsorsLookup(false, true);
+            }
 
             break;
         case "unskip":
@@ -252,13 +280,21 @@ function messageListener(request: Message, sender: unknown, sendResponse: (respo
         case "reskip":
             reskipSponsorTime(sponsorTimes.find((segment) => segment.UUID === request.UUID), true);
             break;
+        case "selectSegment":
+            selectSegment(request.UUID);
+            break;
         case "submitVote":
             vote(request.type, request.UUID).then((response) => sendResponse(response));
             return true;
         case "hideSegment":
             utils.getSponsorTimeFromUUID(sponsorTimes, request.UUID).hidden = request.type;
-            utils.addHiddenSegment(sponsorVideoID, request.UUID, request.type);
+            utils.addHiddenSegment(getVideoID(), request.UUID, request.type);
             updatePreviewBar();
+
+            if (skipButtonControlBar?.isEnabled()
+                && sponsorTimesSubmitting.every((s) => s.hidden !== SponsorHideType.Visible || s.actionType !== ActionType.Poi)) {
+                skipButtonControlBar.disable();
+            }
             break;
         case "closePopup":
             closeInfoMenu();
@@ -267,13 +303,15 @@ function messageListener(request: Message, sender: unknown, sendResponse: (respo
             navigator.clipboard.writeText(request.text);
             break;
         case "importSegments": {
-            const importedSegments = importTimes(request.data, video.duration);
+            const importedSegments = importTimes(request.data, getVideoDuration());
             let addedSegments = false;
             for (const segment of importedSegments) {
                 if (!sponsorTimesSubmitting.some(
                         (s) => Math.abs(s.segment[0] - segment.segment[0]) < 1
                             && Math.abs(s.segment[1] - segment.segment[1]) < 1)) {
-                    if (segment.category === "chapter" && !utils.getCategorySelection("chapter")) {
+                    const hasChaptersPermission = (Config.config.showCategoryWithoutPermission
+                        || Config.config.permissions["chapter"]);
+                    if (segment.category === "chapter" && (!utils.getCategorySelection("chapter") || !hasChaptersPermission)) {
                         segment.category = "chooseACategory" as Category;
                         segment.actionType = ActionType.Skip;
                         segment.description = "";
@@ -285,12 +323,12 @@ function messageListener(request: Message, sender: unknown, sendResponse: (respo
             }
 
             if (addedSegments) {
-                Config.config.unsubmittedSegments[sponsorVideoID] = sponsorTimesSubmitting;
-                Config.forceSyncUpdate("unsubmittedSegments");
+                Config.local.unsubmittedSegments[getVideoID()] = sponsorTimesSubmitting;
+                Config.forceLocalUpdate("unsubmittedSegments");
 
                 updateEditButtonsOnPlayer();
                 updateSponsorTimesSubmitting(false);
-                submitSponsorTimes();
+                openSubmissionMenu();
             }
 
             sendResponse({
@@ -299,7 +337,7 @@ function messageListener(request: Message, sender: unknown, sendResponse: (respo
             break;
         }
         case "keydown":
-            document.dispatchEvent(new KeyboardEvent('keydown', {
+            (document.body || document).dispatchEvent(new KeyboardEvent('keydown', {
                 key: request.key,
                 keyCode: request.keyCode,
                 code: request.code,
@@ -309,6 +347,12 @@ function messageListener(request: Message, sender: unknown, sendResponse: (respo
                 altKey: request.altKey,
                 metaKey: request.metaKey
             }));
+            break;
+        case "getLogs":
+            sendResponse({
+                debug: window["SBLogs"].debug,
+                warn: window["SBLogs"].warn
+            });
             break;
     }
 
@@ -327,7 +371,14 @@ function contentConfigUpdateListener(changes: StorageChangesObject) {
                 updateVisibilityOfPlayerControlsButton()
                 break;
             case "categorySelections":
-                sponsorsLookup();
+                sponsorsLookup(true, true);
+                break;
+            case "barTypes":
+                setCategoryColorCSSVariables();
+                break;
+            case "fullVideoSegments":
+            case "fullVideoLabelsOnThumbnails":
+                updateAll();
                 break;
         }
     }
@@ -341,6 +392,8 @@ function resetValues() {
     lastCheckTime = 0;
     lastCheckVideoTime = -1;
     retryCount = 0;
+    previewedSegment = false;
+    firstPlay = true;
 
     sponsorTimes = [];
     existingChaptersImported = false;
@@ -348,16 +401,9 @@ function resetValues() {
     lastResponseStatus = 0;
     shownSegmentFailedToFetchWarning = false;
 
-    sponsorVideoID = null;
     videoInfo = null;
-    pageType = null;
     channelWhitelisted = false;
-    channelIDInfo = {
-        status: ChannelIDStatus.Fetching,
-        id: null
-    };
     lockedCategories = [];
-    isLivePremiere = false;
 
     //empty the preview bar
     if (previewBar !== null) {
@@ -367,60 +413,34 @@ function resetValues() {
     //reset sponsor data found check
     sponsorDataFound = false;
 
-    if (switchingVideos === null) {
-        // When first loading a video, it is not switching videos
+    // When first loading a video, it is not switching videos
+    // Hover play also doesn't need this check
+    if (switchingVideos === null || !onVideoPage()) {
         switchingVideos = false;
     } else {
         switchingVideos = true;
         logDebug("Setting switching videos to true (reset data)");
     }
 
-    // Reset advert playing flag
-    isAdPlaying = false;
+    skipButtonControlBar?.disable();
+    categoryPill?.setVisibility(false);
 
     for (let i = 0; i < skipNotices.length; i++) {
         skipNotices.pop()?.close();
     }
 
-    skipButtonControlBar?.disable();
-    categoryPill?.setVisibility(false);
-}
-
-async function videoIDChange(id: string): Promise<void> {
-    // don't switch to invalid value
-    if (!id && sponsorVideoID && !document?.URL?.includes("youtube.com/clip/")) return;
-    //if the id has not changed return unless the video element has changed
-    if (sponsorVideoID === id && (isVisible(video) || !video)) return;
-
-    resetValues();
-    sponsorVideoID = id;
-
-	//id is not valid
-    if (!id) return;
-
-    // Wait for options to be ready
-    await utils.wait(() => Config.config !== null, 5000, 1);
-
-    // If enabled, it will check if this video is private or unlisted and double check with the user if the sponsors should be looked up
-    if (Config.config.checkForUnlistedVideos) {
-        const shouldContinue = confirm("SponsorBlock: You have the setting 'Ignore Unlisted/Private Videos' enabled."
-                                + " Due to a change in how segment fetching works, this setting is not needed anymore as it cannot leak your video ID to the server."
-                                + " It instead sends just the first 4 characters of a longer hash of the videoID to the server, and filters through a subset of the database."
-                                + " More info about this implementation can be found here: https://github.com/ajayyy/SponsorBlockServer/issues/25"
-                                + "\n\nPlease click okay to confirm that you acknowledge this and continue using SponsorBlock.");
-        if (shouldContinue) {
-            Config.config.checkForUnlistedVideos = false;
-        } else {
-            return;
-        }
+    if (upcomingNotice) {
+        upcomingNotice.close();
+        upcomingNotice = null;
     }
 
-    // Update whitelist data when the video data is loaded
-    whitelistCheck();
+    hideDeArrowPromotion();
+}
 
+function videoIDChange(): void {
     //setup the preview bar
     if (previewBar === null) {
-        if (onMobileYouTube) {
+        if (isOnMobileYouTube()) {
             // Mobile YouTube workaround
             const observer = new MutationObserver(handleMobileControlsMutations);
             let controlsContainer = null;
@@ -443,7 +463,7 @@ async function videoIDChange(id: string): Promise<void> {
     // Notify the popup about the video change
     chrome.runtime.sendMessage({
         message: "videoChanged",
-        videoID: sponsorVideoID,
+        videoID: getVideoID(),
         whitelisted: channelWhitelisted
     });
 
@@ -455,24 +475,38 @@ async function videoIDChange(id: string): Promise<void> {
     // Clear unsubmitted segments from the previous video
     sponsorTimesSubmitting = [];
     updateSponsorTimesSubmitting();
+
+    tryShowingDeArrowPromotion().catch(logWarn);
+
+    checkPreviewbarState();
+
+    if (getIsInline()) {
+        // Hover preview progress bar can take some time to appear
+        //   and if the miniplayer is also active then it would 
+        //   attach to the wrong one
+        setTimeout(checkPreviewbarState, 500);
+        setTimeout(checkPreviewbarState, 1000);
+        setTimeout(checkPreviewbarState, 3000);
+    }
 }
 
 function handleMobileControlsMutations(): void {
+    // Don't update while scrubbing
+    if (!chrome.runtime?.id 
+            || document.querySelector(".YtProgressBarProgressBarPlayheadDotInDragging")) return;
+
     updateVisibilityOfPlayerControlsButton();
 
     skipButtonControlBar?.updateMobileControls();
 
     if (previewBar !== null) {
-        if (document.body.contains(previewBar.container)) {
-            const progressBarBackground = document.querySelector<HTMLElement>(".progress-bar-background");
-
-            if (progressBarBackground !== null) {
-                updatePreviewBarPositionMobile(progressBarBackground);
-            }
+        if (!previewBar.parent.contains(previewBar.container) && isMobileControlsOpen()) {
+            previewBar.createElement();
+            updatePreviewBar();
 
             return;
-        } else {
-            // The container does not exist anymore, remove that old preview bar
+        } else if (!previewBar.parent.isConnected) {
+            // The parent does not exist anymore, remove that old preview bar
             previewBar.remove();
             previewBar = null;
         }
@@ -482,31 +516,41 @@ function handleMobileControlsMutations(): void {
     createPreviewBar();
 }
 
-/**
- * Creates a preview bar on the video
- */
-function createPreviewBar(): void {
-    if (previewBar !== null) return;
-
+function getPreviewBarAttachElement(): HTMLElement | null {
     const progressElementOptions = [{
-            // For mobile YouTube
-            selector: ".progress-bar-background",
+            // For newer mobile YouTube (Sept 2024)
+            selector: ".YtProgressBarLineHost, .YtChapteredProgressBarHost",
             isVisibleCheck: true
         }, {
-            // For new mobile YouTube (#1287)
-            selector: ".progress-bar-line",
+            // For newer mobile YouTube (May 2024)
+            selector: ".YtmProgressBarProgressBarLine",
             isVisibleCheck: true
         }, {
-            // For Desktop YouTube
+            // For desktop YouTube hover play
+            // Priority is given to the hover play progress bar over the main progress bar
+            //   for miniplayer + hover preview case
+            // Second is new hover play selector
+            selector: "#video-preview .ytp-progress-bar, #video-preview .YtProgressBarLineHost",
+            isVisibleCheck: true
+        }, {
+            // For desktop YouTube
             selector: ".ytp-progress-bar",
             isVisibleCheck: true
         }, {
-            // For Desktop YouTube
+            // For desktop YouTube
             selector: ".no-model.cue-range-marker",
             isVisibleCheck: true
         }, {
             // For Invidious/VideoJS
             selector: ".vjs-progress-holder",
+            isVisibleCheck: false
+        }, {
+            // For Youtube Music and YTKids
+            // there are two sliders, one for volume and one for progress - both called #progressContainer
+            selector: "#progress-bar>#sliderContainer>div>#sliderBar>#progressContainer",
+        }, {
+            // For piped
+            selector: ".shaka-ad-markers",
             isVisibleCheck: false
         }
     ];
@@ -516,13 +560,26 @@ function createPreviewBar(): void {
         const el = option.isVisibleCheck ? findValidElement(allElements) : allElements[0];
 
         if (el) {
-            const chapterVote = new ChapterVote(voteAsync);
-            previewBar = new PreviewBar(el, onMobileYouTube, onInvidious, chapterVote, () => importExistingChapters(false));
-
-            updatePreviewBar();
-
-            break;
+            return el;
         }
+    }
+
+    return null;
+}
+
+/**
+ * Creates a preview bar on the video
+ */
+function createPreviewBar(): void {
+    if (previewBar !== null) return;
+
+    const el = getPreviewBarAttachElement();
+
+    if (el) {
+        const chapterVote = new ChapterVote(voteAsync);
+        previewBar = new PreviewBar(el, isOnMobileYouTube(), isOnInvidious(), chapterVote, () => importExistingChapters(true));
+
+        updatePreviewBar();
     }
 }
 
@@ -557,16 +614,21 @@ function cancelSponsorSchedule(): void {
         clearInterval(currentSkipInterval);
         currentSkipInterval = null;
     }
+
+    if (currentUpcomingSchedule !== null) {
+        clearTimeout(currentUpcomingSchedule);
+        currentUpcomingSchedule = null;
+    }
 }
 
 /**
  * @param currentTime Optional if you don't want to use the actual current time
  */
-function startSponsorSchedule(includeIntersectingSegments = false, currentTime?: number, includeNonIntersectingSegments = true): void {
+async function startSponsorSchedule(includeIntersectingSegments = false, currentTime?: number, includeNonIntersectingSegments = true): Promise<void> {
     cancelSponsorSchedule();
 
     // Don't skip if advert playing and reset last checked time
-    if (isAdPlaying) {
+    if (getIsAdPlaying()) {
         // Reset lastCheckVideoTime
         lastCheckVideoTime = -1;
         lastCheckTime = 0;
@@ -575,34 +637,32 @@ function startSponsorSchedule(includeIntersectingSegments = false, currentTime?:
         return;
     }
 
-    // ensure we are on the correct video
-    const newVideoID = getYouTubeVideoID(document);
-    if (newVideoID !== sponsorVideoID) {
-        videoIDChange(newVideoID);
+    // Give up if video changed, and trigger a videoID change if so
+    if (await checkIfNewVideoID()) {
         return;
     }
 
-    logDebug(`Considering to start skipping: ${!video}, ${video?.paused}`);
-    if (!video) return;
+    logDebug(`Considering to start skipping: ${!getVideo()}, ${getVideo()?.paused}`);
+    if (!getVideo()) return;
     if (currentTime === undefined || currentTime === null) {
         currentTime = getVirtualTime();
     }
-    lastTimeFromWaitingEvent = null;
+    clearWaitingTime();
 
     updateActiveSegment(currentTime);
 
-    if (video.paused) return;
+    if ((getVideo().paused && getCurrentTime() !== 0) // Allow autoplay disabled videos to skip before playing
+        || (getCurrentTime() >= getVideoDuration() - 0.01 && getVideoDuration() > 1)) return;
     const skipInfo = getNextSkipIndex(currentTime, includeIntersectingSegments, includeNonIntersectingSegments);
 
     const currentSkip = skipInfo.array[skipInfo.index];
     const skipTime: number[] = [currentSkip?.scheduledTime, skipInfo.array[skipInfo.endIndex]?.segment[1]];
     const timeUntilSponsor = skipTime?.[0] - currentTime;
-    const videoID = sponsorVideoID;
-    const skipBuffer = 0.003;
+    const videoID = getVideoID();
 
     if (videoMuted && !inMuteSegment(currentTime, skipInfo.index !== -1
             && timeUntilSponsor < skipBuffer && shouldAutoSkip(currentSkip))) {
-        video.muted = false;
+        getVideo().muted = false;
         videoMuted = false;
 
         for (const notice of skipNotices) {
@@ -614,7 +674,7 @@ function startSponsorSchedule(includeIntersectingSegments = false, currentTime?:
     logDebug(`Ready to start skipping: ${skipInfo.index} at ${currentTime}`);
     if (skipInfo.index === -1) return;
 
-    if (Config.config.disableSkipping || channelWhitelisted || (channelIDInfo.status === ChannelIDStatus.Fetching && Config.config.forceChannelCheck)){
+    if (Config.config.disableSkipping || channelWhitelisted || (getChannelIDInfo().status === ChannelIDStatus.Fetching && Config.config.forceChannelCheck)){
         return;
     }
 
@@ -642,12 +702,12 @@ function startSponsorSchedule(includeIntersectingSegments = false, currentTime?:
         let forcedIncludeNonIntersectingSegments = true;
 
         if (incorrectVideoCheck(videoID, currentSkip)) return;
-        forceVideoTime ||= Math.max(video.currentTime, getVirtualTime());
+        forceVideoTime ||= Math.max(getCurrentTime(), getVirtualTime());
 
         if ((shouldSkip(currentSkip) || sponsorTimesSubmitting?.some((segment) => segment.segment === currentSkip.segment))) {
             if (forceVideoTime >= skipTime[0] - skipBuffer && forceVideoTime < skipTime[1]) {
                 skipToTime({
-                    v: video,
+                    v: getVideo(),
                     skipTime,
                     skippingSegments,
                     openNotice: skipInfo.openNotice
@@ -658,7 +718,7 @@ function startSponsorSchedule(includeIntersectingSegments = false, currentTime?:
                     const extraSkip = skipInfo.array[extra];
                     if (shouldSkip(extraSkip)) {
                         skipToTime({
-                            v: video,
+                            v: getVideo(),
                             skipTime: [extraSkip.scheduledTime, extraSkip.segment[1]],
                             skippingSegments: [extraSkip],
                             openNotice: skipInfo.openNotice
@@ -671,8 +731,12 @@ function startSponsorSchedule(includeIntersectingSegments = false, currentTime?:
                     forcedSkipTime = skipTime[0] + 0.001;
                 } else {
                     forcedSkipTime = skipTime[1];
-                    forcedIncludeIntersectingSegments = true;
                     forcedIncludeNonIntersectingSegments = false;
+
+                    // Only if not at the end of the video
+                    if (Math.abs(skipTime[1] - getVideoDuration()) > endTimeSkipBuffer) {
+                        forcedIncludeIntersectingSegments = true;
+                    }
                 }
             } else {
                 forcedSkipTime = forceVideoTime + 0.001;
@@ -681,55 +745,106 @@ function startSponsorSchedule(includeIntersectingSegments = false, currentTime?:
             forcedSkipTime = forceVideoTime + 0.001;
         }
 
+        // Don't pretend to be earlier than we are, could result in loops
+        if (forcedSkipTime !== null && forceVideoTime > forcedSkipTime) {
+            forcedSkipTime = forceVideoTime;
+        }
+
         startSponsorSchedule(forcedIncludeIntersectingSegments, forcedSkipTime, forcedIncludeNonIntersectingSegments);
     };
 
     if (timeUntilSponsor < skipBuffer) {
         skippingFunction(currentTime);
     } else {
-        const delayTime = timeUntilSponsor * 1000 * (1 / video.playbackRate);
-        if (delayTime < 300) {
-            // Use interval instead of timeout near the end to combat imprecise video time
-            const startIntervalTime = performance.now();
-            const startVideoTime = Math.max(currentTime, video.currentTime);
-            logDebug(`Starting setInterval skipping ${video.currentTime} to skip at ${skipTime[0]}`);
+        let delayTime = timeUntilSponsor * 1000 * (1 / getVideo().playbackRate);
+        if (delayTime < (isFirefoxOrSafari() && !isSafari() ? 750 : 300)) {
+            let forceStartIntervalTime: number | null = null;
+            if (isFirefoxOrSafari() && !isSafari() && delayTime > 300) {
+                forceStartIntervalTime = await waitForNextTimeChange();
+            }
 
+            // Use interval instead of timeout near the end to combat imprecise video time
+            const startIntervalTime = forceStartIntervalTime || performance.now();
+            const startVideoTime = Math.max(currentTime, getCurrentTime());
+            delayTime = (skipTime?.[0] - startVideoTime) * 1000 * (1 / getVideo().playbackRate);
+
+            let startWaitingForReportedTimeToChange = true;
+            const reportedVideoTimeAtStart = getCurrentTime();
+            logDebug(`Starting setInterval skipping ${getCurrentTime()} to skip at ${skipTime[0]}`);
+
+            if (currentSkipInterval !== null) clearInterval(currentSkipInterval);
             currentSkipInterval = setInterval(() => {
+                // Estimate delay, but only take the current time right after a change
+                // Current time remains the same for many "frames" on Firefox
+                if (isFirefoxOrSafari() && !lastKnownVideoTime.fromPause && startWaitingForReportedTimeToChange
+                        && reportedVideoTimeAtStart !== getCurrentTime()) {
+                    startWaitingForReportedTimeToChange = false;
+                    const delay = getVirtualTime() - getCurrentTime();
+                    if (delay > 0) lastKnownVideoTime.approximateDelay = delay;
+                }
+
                 const intervalDuration = performance.now() - startIntervalTime;
-                if (intervalDuration >= delayTime || video.currentTime >= skipTime[0]) {
+                if (intervalDuration + skipBuffer * 1000 >= delayTime || getCurrentTime() >= skipTime[0]) {
                     clearInterval(currentSkipInterval);
-                    if (!utils.isFirefox() && !video.muted) {
+                    if (!isFirefoxOrSafari() && !getVideo().muted && !inMuteSegment(getCurrentTime(), true)) {
                         // Workaround for more accurate skipping on Chromium
-                        video.muted = true;
-                        video.muted = false;
+                        getVideo().muted = true;
+                        getVideo().muted = false;
                     }
 
-                    skippingFunction(Math.max(video.currentTime, startVideoTime + video.playbackRate * intervalDuration / 1000));
+                    skippingFunction(Math.max(getCurrentTime(), startVideoTime + getVideo().playbackRate * Math.max(delayTime, intervalDuration) / 1000));
                 }
-            }, 1);
+            }, 0);
         } else {
-            logDebug(`Starting timeout to skip ${video.currentTime} to skip at ${skipTime[0]}`);
+            logDebug(`Starting timeout to skip ${getCurrentTime()} to skip at ${skipTime[0]}`);
 
+            const offset = (isFirefoxOrSafari() && !isSafari() ? 600 : 150);
             // Schedule for right before to be more precise than normal timeout
-            currentSkipSchedule = setTimeout(skippingFunction, Math.max(0, delayTime - 150));
+            const offsetDelayTime = Math.max(0, delayTime - offset);
+            currentSkipSchedule = setTimeout(skippingFunction, offsetDelayTime);
+
+            // Show the notice only if the segment hasn't already started
+            if (Config.config.showUpcomingNotice && getCurrentTime() < skippingSegments[0].segment[0] 
+                    && !sponsorTimesSubmitting?.some((segment) => segment.segment === currentSkip.segment)
+                    && [ActionType.Skip, ActionType.Mute].includes(skippingSegments[0].actionType)
+                    && !getVideo()?.paused) {
+                const maxPopupTime = 3000;
+                const timeUntilPopup = Math.max(0, offsetDelayTime - maxPopupTime);
+                const popupTime = offsetDelayTime - timeUntilPopup;
+                const autoSkip = shouldAutoSkip(skippingSegments[0]);
+
+                if (currentUpcomingSchedule) clearTimeout(currentUpcomingSchedule);
+                currentUpcomingSchedule = setTimeout(createUpcomingNotice, timeUntilPopup, [skippingSegments[0]], popupTime, autoSkip);
+            }
         }
     }
 }
 
-function getVirtualTime(): number {
-    const virtualTime = lastTimeFromWaitingEvent ?? (lastKnownVideoTime.videoTime ?
-        (performance.now() - lastKnownVideoTime.preciseTime) * video.playbackRate / 1000 + lastKnownVideoTime.videoTime : null);
+/**
+ * Used on Firefox only, waits for the next animation frame until
+ * the video time has changed
+ */
+function waitForNextTimeChange(): Promise<DOMHighResTimeStamp | null> {
+    return new Promise((resolve) => {
+        getVideo().addEventListener("timeupdate", () => resolve(performance.now()), { once: true });
+    });
+}
 
-    if (Config.config.useVirtualTime && !utils.isFirefox() && !isSafari() && virtualTime 
-            && Math.abs(virtualTime - video.currentTime) < 0.6 && video.currentTime !== 0) {
-        return virtualTime;
+function getVirtualTime(): number {
+    const virtualTime = lastTimeFromWaitingEvent ?? (lastKnownVideoTime.videoTime !== null ?
+        (performance.now() - lastKnownVideoTime.preciseTime) * (getVideo()?.playbackRate || 1) / 1000 + lastKnownVideoTime.videoTime : null);
+
+    if (Config.config.useVirtualTime && !isSafari() && virtualTime
+            && Math.abs(virtualTime - getCurrentTime()) < 0.2 && getCurrentTime() !== 0) {
+        return Math.max(virtualTime, getCurrentTime());
     } else {
-        return video.currentTime;
+        return getCurrentTime();
     }
 }
 
 function inMuteSegment(currentTime: number, includeOverlap: boolean): boolean {
     const checkFunction = (segment) => segment.actionType === ActionType.Mute
+        && segment.hidden === SponsorHideType.Visible
         && segment.segment[0] <= currentTime
         && (segment.segment[1] > currentTime || (includeOverlap && segment.segment[1] + 0.02 > currentTime));
     return sponsorTimes?.some(checkFunction) || sponsorTimesSubmitting.some(checkFunction);
@@ -739,16 +854,20 @@ function inMuteSegment(currentTime: number, includeOverlap: boolean): boolean {
  * This makes sure the videoID is still correct and if the sponsorTime is included
  */
 function incorrectVideoCheck(videoID?: string, sponsorTime?: SponsorTime): boolean {
-    const currentVideoID = getYouTubeVideoID(document);
-    if (currentVideoID !== (videoID || sponsorVideoID) || (sponsorTime
-            && (!sponsorTimes || !sponsorTimes?.some((time) => time.segment === sponsorTime.segment))
-            && !sponsorTimesSubmitting.some((time) => time.segment === sponsorTime.segment))) {
+    if (!onVideoPage()) return false;
+
+    const currentVideoID = getYouTubeVideoID();
+    const recordedVideoID = videoID || getVideoID();
+    if (currentVideoID !== recordedVideoID || (sponsorTime
+            && (!sponsorTimes || !sponsorTimes?.some((time) => time.segment[0] === sponsorTime.segment[0] && time.segment[1] === sponsorTime.segment[1]))
+            && !sponsorTimesSubmitting.some((time) => time.segment[0] === sponsorTime.segment[0] && time.segment[1] === sponsorTime.segment[1]))) {
         // Something has really gone wrong
         console.error("[SponsorBlock] The videoID recorded when trying to skip is different than what it should be.");
-        console.error("[SponsorBlock] VideoID recorded: " + sponsorVideoID + ". Actual VideoID: " + currentVideoID);
+        console.error("[SponsorBlock] VideoID recorded: " + recordedVideoID + ". Actual VideoID: " + currentVideoID);
+        console.error("[SponsorBlock] SponsorTime", sponsorTime, "sponsorTimes", sponsorTimes, "sponsorTimesSubmitting", sponsorTimesSubmitting);
 
         // Video ID change occured
-        videoIDChange(currentVideoID);
+        checkVideoIDChange();
 
         return true;
     } else {
@@ -756,64 +875,47 @@ function incorrectVideoCheck(videoID?: string, sponsorTime?: SponsorTime): boole
     }
 }
 
-function setupVideoMutationListener() {
-    const videoContainer = document.querySelector(".html5-video-container");
-    if (!videoContainer || videoMutationObserver !== null || onInvidious) return;
+let playbackRateCheckInterval: NodeJS.Timeout | null = null;
+let lastPlaybackSpeed = 1;
+let setupVideoListenersFirstTime = true;
+function setupVideoListeners(video: HTMLVideoElement) {
+    if (!video) return; // Maybe video became invisible
 
-    videoMutationObserver = new MutationObserver(refreshVideoAttachments);
-
-    videoMutationObserver.observe(videoContainer, {
-        attributes: true,
-        childList: true,
-        subtree: true
-    });
-}
-
-async function refreshVideoAttachments(): Promise<void> {
-    if (waitingForNewVideo) return;
-
-    waitingForNewVideo = true;
-    const newVideo = await utils.waitForElement("video", true) as HTMLVideoElement;
-    waitingForNewVideo = false;
-
-    video = newVideo;
-    if (!videosWithEventListeners.includes(video)) {
-        videosWithEventListeners.push(video);
-
-        setupVideoListeners();
-        setupSkipButtonControlBar();
-        setupCategoryPill();
-    }
-
-    if (previewBar && !utils.findReferenceNode()?.contains(previewBar.container)) {
-        previewBar.remove();
-        previewBar = null;
-
-        createPreviewBar();
-    }
-
-    videoIDChange(getYouTubeVideoID(document));
-}
-
-function setupVideoListeners() {
     //wait until it is loaded
     video.addEventListener('loadstart', videoOnReadyListener)
     video.addEventListener('durationchange', durationChangeListener);
+
+    if (setupVideoListenersFirstTime) {
+        addCleanupListener(() => {
+            video.removeEventListener('loadstart', videoOnReadyListener);
+            video.removeEventListener('durationchange', durationChangeListener);
+        });
+    }
 
     if (!Config.config.disableSkipping) {
         switchingVideos = false;
 
         let startedWaiting = false;
         let lastPausedAtZero = true;
+        let lastVideoDataChange = 0;
 
-        video.addEventListener('play', () => {
-            // If it is not the first event, then the only way to get to 0 is if there is a seek event
-            // This check makes sure that changing the video resolution doesn't cause the extension to think it
-            // gone back to the begining
-            if (video.readyState <= HTMLMediaElement.HAVE_CURRENT_DATA
-                    && video.currentTime === 0) return;
-
+        const rateChangeListener = () => {
             updateVirtualTime();
+            clearWaitingTime();
+
+            startSponsorSchedule();
+        };
+        video.addEventListener('ratechange', rateChangeListener);
+        // Used by videospeed extension (https://github.com/igrigorik/videospeed/pull/740)
+        video.addEventListener('videoSpeed_ratechange', rateChangeListener);
+
+        const playListener = () => {
+            // Prevent video resolution changes from causing skips
+            if (!firstPlay && Date.now() - lastVideoDataChange < 200 && video.currentTime === 0) return;
+
+            firstPlay = false;
+            updateVirtualTime();
+            checkForMiniplayerPlaying();
 
             if (switchingVideos || lastPausedAtZero) {
                 switchingVideos = false;
@@ -836,9 +938,10 @@ function setupVideoListeners() {
 
                 startSponsorSchedule();
             }
+        };
+        video.addEventListener('play', playListener);
 
-        });
-        video.addEventListener('playing', () => {
+        const playingListener = () => {
             updateVirtualTime();
             lastPausedAtZero = false;
 
@@ -864,81 +967,185 @@ function setupVideoListeners() {
 
                 startSponsorSchedule();
             }
-        });
-        video.addEventListener('seeking', () => {
+
+            if (playbackRateCheckInterval) clearInterval(playbackRateCheckInterval);
+            lastPlaybackSpeed = video.playbackRate;
+
+            // Video speed controller compatibility
+            // That extension makes rate change events not propagate
+            if (document.body.classList.contains("vsc-initialized")) {
+                playbackRateCheckInterval = setInterval(() => {
+                    if ((!getVideoID() || video.paused) && playbackRateCheckInterval) {
+                        // Video is gone, stop checking
+                        clearInterval(playbackRateCheckInterval);
+                        return;
+                    }
+    
+                    if (video.playbackRate !== lastPlaybackSpeed) {
+                        lastPlaybackSpeed = video.playbackRate;
+    
+                        rateChangeListener();
+                    }
+                }, 2000);
+            }
+        };
+        video.addEventListener('playing', playingListener);
+        
+        const seekingListener = () => {
+            lastKnownVideoTime.fromPause = false;
+
             if (!video.paused){
                 // Reset lastCheckVideoTime
                 lastCheckTime = Date.now();
                 lastCheckVideoTime = video.currentTime;
 
                 updateVirtualTime();
-                lastTimeFromWaitingEvent = null;
+                clearWaitingTime();
 
-                startSponsorSchedule();
+                // Sometimes looped videos loop back to almost zero, but not quite
+                if (video.loop && video.currentTime < 0.2 && getCurrentTime() < 0.2) {
+                    startSponsorSchedule(false, 0);
+                } else {
+                    startSponsorSchedule();
+                }
             } else {
-                updateActiveSegment(video.currentTime);
+                updateActiveSegment(getCurrentTime());
 
-                if (video.currentTime === 0) {
+                if (getCurrentTime() === 0) {
                     lastPausedAtZero = true;
                 }
             }
-        });
-        video.addEventListener('ratechange', () => {
-            updateVirtualTime();
-            lastTimeFromWaitingEvent = null;
-
-            startSponsorSchedule();
-        });
-        // Used by videospeed extension (https://github.com/igrigorik/videospeed/pull/740)
-        video.addEventListener('videoSpeed_ratechange', () => {
-            updateVirtualTime();
-            lastTimeFromWaitingEvent = null;
-
-            startSponsorSchedule();
-        });
-        const paused = () => {
+        };
+        video.addEventListener('seeking', seekingListener);
+        
+        const stoppedPlayback = () => {
             // Reset lastCheckVideoTime
             lastCheckVideoTime = -1;
             lastCheckTime = 0;
 
-            lastKnownVideoTime = {
-                videoTime: null,
-                preciseTime: null
-            }
-            lastTimeFromWaitingEvent = video.currentTime;
+            if (playbackRateCheckInterval) clearInterval(playbackRateCheckInterval);
+
+            lastKnownVideoTime.videoTime = null;
+            lastKnownVideoTime.preciseTime = null;
+            updateWaitingTime(video);
 
             cancelSponsorSchedule();
         };
-        video.addEventListener('pause', () => paused());
-        video.addEventListener('waiting', () => {
+        const pauseListener = () => {
+            lastKnownVideoTime.fromPause = true;
+
+            stoppedPlayback();
+        };
+        video.addEventListener('pause', pauseListener);
+        const waitingListener = () => {
             logDebug("[SB] Not skipping due to buffering");
             startedWaiting = true;
 
-            paused();
-        });
+            stoppedPlayback();
+        };
+        video.addEventListener('waiting', waitingListener);
+
+        // When video data is changed
+        const emptyListener = () => {
+            lastVideoDataChange = Date.now();
+
+            if (firstPlay && video.currentTime === 0) {
+                playListener();
+            }
+        }
+        video.addEventListener('emptied', emptyListener);
+
+        // For when autoplay is off to skip before starting playback
+        const metadataLoadedListener = () => {
+            if (firstPlay && getCurrentTime() === 0) {
+                playListener();
+            }
+        }
+        video.addEventListener('loadedmetadata', metadataLoadedListener)
 
         startSponsorSchedule();
+
+        if (setupVideoListenersFirstTime) {
+            addCleanupListener(() => {
+                video.removeEventListener('play', playListener);
+                video.removeEventListener('playing', playingListener);
+                video.removeEventListener('seeking', seekingListener);
+                video.removeEventListener('ratechange', rateChangeListener);
+                video.removeEventListener('videoSpeed_ratechange', rateChangeListener);
+                video.removeEventListener('pause', pauseListener);
+                video.removeEventListener('waiting', waitingListener);
+                video.removeEventListener('empty', emptyListener);
+                video.removeEventListener('loadedmetadata', metadataLoadedListener);
+
+                if (playbackRateCheckInterval) clearInterval(playbackRateCheckInterval);
+            });
+        }
     }
+
+    setupVideoListenersFirstTime = false;
 }
 
 function updateVirtualTime() {
-    lastKnownVideoTime = {
-        videoTime: video.currentTime,
-        preciseTime: performance.now()
-    };
+    if (currentVirtualTimeInterval) clearInterval(currentVirtualTimeInterval);
+
+    lastKnownVideoTime.videoTime = getCurrentTime();
+    lastKnownVideoTime.preciseTime = performance.now();
+
+    // If on Firefox, wait for the second time change (time remains fixed for many "frames" for privacy reasons)
+    if (isFirefoxOrSafari()) {
+        let count = 0;
+        let rawCount = 0;
+        let lastTime = lastKnownVideoTime.videoTime;
+        let lastPerformanceTime = performance.now();
+
+        currentVirtualTimeInterval = setInterval(() => {
+            const frameTime = performance.now() - lastPerformanceTime;
+            if (lastTime !== getCurrentTime()) {
+                rawCount++;
+
+                // If there is lag, give it another shot at finding a good change time
+                if (frameTime < 20 || rawCount > 30) {
+                    count++;
+                }
+                lastTime = getCurrentTime();
+            }
+
+            if (count > 1) {
+                const delay = lastKnownVideoTime.fromPause && lastKnownVideoTime.approximateDelay ?
+                    lastKnownVideoTime.approximateDelay : 0;
+
+                lastKnownVideoTime.videoTime = getCurrentTime() + delay;
+                lastKnownVideoTime.preciseTime = performance.now();
+
+                clearInterval(currentVirtualTimeInterval);
+                currentVirtualTimeInterval = null;
+            }
+
+            lastPerformanceTime = performance.now();
+        }, 1);
+    }
+}
+
+function updateWaitingTime(video: HTMLVideoElement): void {
+    lastTimeFromWaitingEvent = video.currentTime;
+}
+
+function clearWaitingTime(): void {
+    lastTimeFromWaitingEvent = null;
 }
 
 function setupSkipButtonControlBar() {
     if (!skipButtonControlBar) {
         skipButtonControlBar = new SkipButtonControlBar({
             skip: (segment) => skipToTime({
-                v: video,
+                v: getVideo(),
                 skipTime: segment.segment,
                 skippingSegments: [segment],
                 openNotice: true,
                 forceAutoSkip: true
             }),
-            onMobileYouTube
+            selectSegment,
+            onMobileYouTube: isOnMobileYouTube()
         });
     }
 
@@ -950,166 +1157,89 @@ function setupCategoryPill() {
         categoryPill = new CategoryPill();
     }
 
-    categoryPill.attachToPage(onMobileYouTube, onInvidious, voteAsync);
+    categoryPill.attachToPage(isOnMobileYouTube(), isOnInvidious(), voteAsync);
 }
 
-async function sponsorsLookup(keepOldSubmissions = true) {
-    if (!video || !isVisible(video)) refreshVideoAttachments();
-    //there is still no video here
-    if (!video) {
-        setTimeout(() => sponsorsLookup(), 100);
+async function sponsorsLookup(keepOldSubmissions = true, ignoreCache = false) {
+    const videoID = getVideoID();
+    if (!videoID) {
+        console.error("[SponsorBlock] Attempted to fetch segments with a null/undefined videoID.");
         return;
     }
 
-    setupVideoMutationListener();
+    const segmentData = await getSegmentsForVideo(videoID, ignoreCache);
 
-    const showChapterMessage = Config.config.showUpsells
-        && Config.config.payments.lastCheck !== 0
-        && !noRefreshFetchingChaptersAllowed()
-        && Config.config.showChapterInfoMessage
-        && Config.config.skipCount > 200;
-
-    if (!showChapterMessage
-            && Config.config.showChapterInfoMessage
-            && Config.config.payments.freeAccess) {
-        Config.config.showChapterInfoMessage = false;
-
-        if (!utils.getCategorySelection("chapter")) {
-            const prependElement = document.querySelector(".ytp-chrome-bottom") as HTMLElement;
-            if (prependElement) {
-                Config.config.showChapterInfoMessage = false;
-                new Tooltip({
-                    text: chrome.i18n.getMessage("chapterNewFeature2"),
-                    linkOnClick: () => void chrome.runtime.sendMessage({ "message": "openConfig" }),
-                    referenceNode: prependElement.parentElement,
-                    prependElement,
-                    timeout: 1500,
-                    leftOffset: "20px",
-                    positionRealtive: false
-                });
-            }
-        }
-    }
-
-    const categories: string[] = Config.config.categorySelections.map((category) => category.name);
-    if (showChapterMessage && !categories.includes("chapter")) categories.push("chapter");
-
-    const extraRequestData: Record<string, unknown> = {};
-    const hashParams = getHashParams();
-    if (hashParams.requiredSegment) extraRequestData.requiredSegment = hashParams.requiredSegment;
-
-    const hashPrefix = (await utils.getHash(sponsorVideoID, 1)).slice(0, 4) as VideoID & HashedValue;
-    const response = await utils.asyncRequestToServer('GET', "/api/skipSegments/" + hashPrefix, {
-        categories,
-        actionTypes: getEnabledActionTypes(showChapterMessage),
-        userAgent: `${chrome.runtime.id}`,
-        ...extraRequestData
-    });
+    // Make sure an old pending request doesn't get used.
+    if (videoID !== getVideoID()) return;
 
     // store last response status
-    lastResponseStatus = response?.status;
+    lastResponseStatus = segmentData.status;
+    if (segmentData.status === 200) {
+        const receivedSegments = segmentData.segments;
 
-    if (response?.ok) {
-        let recievedSegments: SponsorTime[] = JSON.parse(response.responseText)
-                    ?.filter((video) => video.videoID === sponsorVideoID)
-                    ?.map((video) => video.segments)?.[0]
-                    ?.map((segment) => ({
-                        ...segment,
-                        source: SponsorSourceType.Server
-                    }))
-                    ?.sort((a, b) => a.segment[0] - b.segment[0]);
-        if (!recievedSegments || !recievedSegments.length) {
-            // return if no video found
-            chrome.runtime.sendMessage({
-                message: "infoUpdated",
-                found: false,
-                status: lastResponseStatus,
-                sponsorTimes: sponsorTimes,
-                time: video.currentTime,
-                onMobileYouTube
-            });
+        if (receivedSegments && receivedSegments.length) {
+            sponsorDataFound = true;
+
+            // Check if any old submissions should be kept
+            if (sponsorTimes !== null && keepOldSubmissions) {
+                for (let i = 0; i < sponsorTimes.length; i++) {
+                    if (sponsorTimes[i].source === SponsorSourceType.Local)  {
+                        // This is a user submission, keep it
+                        receivedSegments.push(sponsorTimes[i]);
+                    }
+                }
+            }
+
+            const oldSegments = sponsorTimes || [];
+            sponsorTimes = receivedSegments;
+            existingChaptersImported = false;
+
+            // Hide all submissions smaller than the minimum duration
+            if (Config.config.minDuration !== 0) {
+                for (const segment of sponsorTimes) {
+                    const duration = segment.segment[1] - segment.segment[0];
+                    if (duration > 0 && duration < Config.config.minDuration) {
+                        segment.hidden = SponsorHideType.MinimumDuration;
+                    }
+                }
+            }
+
+            if (keepOldSubmissions) {
+                for (const segment of oldSegments) {
+                    const otherSegment = sponsorTimes.find((other) => segment.UUID === other.UUID);
+                    if (otherSegment) {
+                        // If they downvoted it, or changed the category, keep it
+                        otherSegment.hidden = segment.hidden;
+                        otherSegment.category = segment.category;
+                    }
+                }
+            }
+
+            // See if some segments should be hidden
+            const hashPrefix = (await getHash(videoID, 1)).slice(0, 4) as VideoID & HashedValue;
+            const downvotedData = Config.local.downvotedSegments[hashPrefix];
+            if (downvotedData) {
+                for (const segment of sponsorTimes) {
+                    const hashedUUID = await getHash(segment.UUID, 1);
+                    const segmentDownvoteData = downvotedData.segments.find((downvote) => downvote.uuid === hashedUUID);
+                    if (segmentDownvoteData) {
+                        segment.hidden = segmentDownvoteData.hidden;
+                    }
+                }
+            }
+
+            if (!getVideo()) {
+                //there is still no video here
+                await waitForVideo();
+            }
+
+            startSkipScheduleCheckingForStartSponsors();
+
+            if (!isNaN(getVideoDuration())) {
+                updatePreviewBar();
+            }
+        } else {
             retryFetch(404);
-            return;
-        }
-
-        if (showChapterMessage) {
-            const chapterSegments = recievedSegments.filter((s) => s.actionType === ActionType.Chapter);
-            if (chapterSegments.length > 3) {
-                const prependElement = document.querySelector(".ytp-chrome-bottom") as HTMLElement;
-                if (prependElement) {
-                    Config.config.showChapterInfoMessage = false;
-                    new Tooltip({
-                        text: `🟨${chrome.i18n.getMessage("chapterNewFeature")}${chapterSegments.slice(0, 3).map((s) => s.description).join(", ")}`,
-                        linkOnClick: () => void chrome.runtime.sendMessage({ "message": "openUpsell" }),
-                        referenceNode: prependElement.parentElement,
-                        prependElement,
-                        timeout: 1500,
-                        leftOffset: "20px",
-                        positionRealtive: false
-                    });
-                }
-            }
-
-            recievedSegments = recievedSegments.filter((s) => s.actionType !== ActionType.Chapter);
-        }
-
-        sponsorDataFound = true;
-
-        // Check if any old submissions should be kept
-        if (sponsorTimes !== null && keepOldSubmissions) {
-            for (let i = 0; i < sponsorTimes.length; i++) {
-                if (sponsorTimes[i].source === SponsorSourceType.Local)  {
-                    // This is a user submission, keep it
-                    recievedSegments.push(sponsorTimes[i]);
-                }
-            }
-        }
-
-        const oldSegments = sponsorTimes || [];
-        sponsorTimes = recievedSegments;
-        existingChaptersImported = false;
-
-        // Hide all submissions smaller than the minimum duration
-        if (Config.config.minDuration !== 0) {
-            for (const segment of sponsorTimes) {
-                const duration = segment.segment[1] - segment.segment[0];
-                if (duration > 0 && duration < Config.config.minDuration) {
-                    segment.hidden = SponsorHideType.MinimumDuration;
-                }
-            }
-        }
-
-        if (keepOldSubmissions) {
-            for (const segment of oldSegments) {
-                const otherSegment = sponsorTimes.find((other) => segment.UUID === other.UUID);
-                if (otherSegment) {
-                    // If they downvoted it, or changed the category, keep it
-                    otherSegment.hidden = segment.hidden;
-                    otherSegment.category = segment.category;
-                }
-            }
-        }
-
-        // See if some segments should be hidden
-        const downvotedData = Config.local.downvotedSegments[hashPrefix];
-        if (downvotedData) {
-            for (const segment of sponsorTimes) {
-                const hashedUUID = await utils.getHash(segment.UUID, 1);
-                const segmentDownvoteData = downvotedData.segments.find((downvote) => downvote.uuid === hashedUUID);
-                if (segmentDownvoteData) {
-                    segment.hidden = segmentDownvoteData.hidden;
-                }
-            }
-        }
-
-        startSkipScheduleCheckingForStartSponsors();
-
-        //update the preview bar
-        //leave the type blank for now until categories are added
-        if (lastPreviewBarUpdate == sponsorVideoID || (lastPreviewBarUpdate == null && !isNaN(video.duration))) {
-            //set it now
-            //otherwise the listener can handle it
-            updatePreviewBar();
         }
     } else {
         retryFetch(lastResponseStatus);
@@ -1123,8 +1253,8 @@ async function sponsorsLookup(keepOldSubmissions = true) {
         found: sponsorDataFound,
         status: lastResponseStatus,
         sponsorTimes: sponsorTimes,
-        time: video.currentTime,
-        onMobileYouTube
+        time: getCurrentTime() ?? 0,
+        onMobileYouTube: isOnMobileYouTube()
     });
 
     if (Config.config.isVip) {
@@ -1133,37 +1263,39 @@ async function sponsorsLookup(keepOldSubmissions = true) {
 }
 
 function importExistingChapters(wait: boolean) {
-    if (!existingChaptersImported) {
-        GenericUtils.wait(() => video?.duration && getExistingChapters(sponsorVideoID, video.duration),
-            wait ? 5000 : 0, 100, (c) => c?.length > 0).then((chapters) => {
-                if (!existingChaptersImported && chapters?.length > 0) {
-                    sponsorTimes = (sponsorTimes ?? []).concat(...chapters).sort((a, b) => a.segment[0] - b.segment[0]);
-                    existingChaptersImported = true;
-                    updatePreviewBar();
-                }
-            }).catch(() => {}); // eslint-disable-line @typescript-eslint/no-empty-function
-    }
-}
+    if (!existingChaptersImported && !importingChaptersWaiting && onVideoPage() && !isOnMobileYouTube()) {
+        const waitCondition = () => getVideoDuration() && getExistingChapters(getVideoID(), getVideoDuration());
 
-function getEnabledActionTypes(forceFullVideo = false): ActionType[] {
-    const actionTypes = [ActionType.Skip, ActionType.Poi, ActionType.Chapter];
-    if (Config.config.muteSegments) {
-        actionTypes.push(ActionType.Mute);
-    }
-    if (Config.config.fullVideoSegments || forceFullVideo) {
-        actionTypes.push(ActionType.Full);
-    }
+        if (wait && !document.hasFocus() && !importingChaptersWaitingForFocus && !waitCondition()) {
+            importingChaptersWaitingForFocus = true;
+            const listener = () => {
+                importExistingChapters(wait);
+                window.removeEventListener("focus", listener);
+            };
+            window.addEventListener("focus", listener);
+        } else {
+            importingChaptersWaiting = true;
+            waitFor(waitCondition,
+                wait ? 15000 : 0, 400, (c) => c?.length > 0).then((chapters) => {
+                    importingChaptersWaiting = false;
 
-    return actionTypes;
+                    if (!existingChaptersImported && chapters?.length > 0) {
+                        sponsorTimes = (sponsorTimes ?? []).concat(...chapters).sort((a, b) => a.segment[0] - b.segment[0]);
+                        existingChaptersImported = true;
+                        updatePreviewBar();
+                    }
+                }).catch(() => { importingChaptersWaiting = false; }); // eslint-disable-line @typescript-eslint/no-empty-function
+        }
+    }
 }
 
 async function lockedCategoriesLookup(): Promise<void> {
-    const hashPrefix = (await utils.getHash(sponsorVideoID, 1)).slice(0, 4);
-    const response = await utils.asyncRequestToServer("GET", "/api/lockCategories/" + hashPrefix);
+    const hashPrefix = (await getHash(getVideoID(), 1)).slice(0, 4);
+    const response = await asyncRequestToServer("GET", "/api/lockCategories/" + hashPrefix);
 
     if (response.ok) {
         try {
-            const categoriesResponse = JSON.parse(response.responseText).filter((lockInfo) => lockInfo.videoID === sponsorVideoID)[0]?.categories;
+            const categoriesResponse = JSON.parse(response.responseText).filter((lockInfo) => lockInfo.videoID === getVideoID())[0]?.categories;
             if (Array.isArray(categoriesResponse)) {
                 lockedCategories = categoriesResponse;
             }
@@ -1185,9 +1317,9 @@ function retryFetch(errorCode: number): void {
 
     const delay = errorCode === 404 ? (30000 + Math.random() * 30000) : (2000 + Math.random() * 10000);
     retryFetchTimeout = setTimeout(() => {
-        if (sponsorVideoID && sponsorTimes?.length === 0
+        if (getVideoID() && sponsorTimes?.length === 0
                 || sponsorTimes.every((segment) => segment.source !== SponsorSourceType.Server)) {
-            sponsorsLookup();
+            // sponsorsLookup();
         }
     }, delay);
 }
@@ -1199,12 +1331,12 @@ function retryFetch(errorCode: number): void {
  */
 function startSkipScheduleCheckingForStartSponsors() {
 	// switchingVideos is ignored in Safari due to event fire order. See #1142
-    if ((!switchingVideos || isSafari) && sponsorTimes) {
+    if ((!switchingVideos || isSafari()) && sponsorTimes) {
         // See if there are any starting sponsors
         let startingSegmentTime = getStartTimeFromUrl(document.URL) || -1;
         let found = false;
         for (const time of sponsorTimes) {
-            if (time.segment[0] <= video.currentTime && time.segment[0] > startingSegmentTime && time.segment[1] > video.currentTime
+            if (time.segment[0] <= getCurrentTime() && time.segment[0] > startingSegmentTime && time.segment[1] > getCurrentTime()
                     && time.actionType !== ActionType.Poi) {
                         startingSegmentTime = time.segment[0];
                         found = true;
@@ -1213,7 +1345,7 @@ function startSkipScheduleCheckingForStartSponsors() {
         }
         if (!found) {
             for (const time of sponsorTimesSubmitting) {
-                if (time.segment[0] <= video.currentTime && time.segment[0] > startingSegmentTime && time.segment[1] > video.currentTime
+                if (time.segment[0] <= getCurrentTime() && time.segment[0] > startingSegmentTime && time.segment[1] > getCurrentTime()
                         && time.actionType !== ActionType.Poi) {
                             startingSegmentTime = time.segment[0];
                             found = true;
@@ -1224,17 +1356,18 @@ function startSkipScheduleCheckingForStartSponsors() {
 
         // For highlight category
         const poiSegments = sponsorTimes
-            .filter((time) => time.segment[1] > video.currentTime && time.actionType === ActionType.Poi)
+            .filter((time) => time.segment[1] > getCurrentTime()
+                && time.actionType === ActionType.Poi && time.hidden === SponsorHideType.Visible)
             .sort((a, b) => b.segment[0] - a.segment[0]);
         for (const time of poiSegments) {
             const skipOption = utils.getCategorySelection(time.category)?.option;
             if (skipOption !== CategorySkipOption.ShowOverlay) {
                 skipToTime({
-                    v: video,
+                    v: getVideo(),
                     skipTime: time.segment,
                     skippingSegments: [time],
                     openNotice: true,
-                    unskipTime: video.currentTime
+                    unskipTime: getCurrentTime()
                 });
                 if (skipOption === CategorySkipOption.AutoSkip) break;
             }
@@ -1242,7 +1375,9 @@ function startSkipScheduleCheckingForStartSponsors() {
 
         const fullVideoSegment = sponsorTimes.filter((time) => time.actionType === ActionType.Full)[0];
         if (fullVideoSegment) {
-            categoryPill?.setSegment(fullVideoSegment);
+            waitFor(() => categoryPill).then(() => {
+                categoryPill?.setSegment(fullVideoSegment);
+            });
         }
 
         if (startingSegmentTime !== -1) {
@@ -1253,102 +1388,23 @@ function startSkipScheduleCheckingForStartSponsors() {
     }
 }
 
-function getYouTubeVideoID(document: Document, url?: string): string {
-    url ||= document.URL;
-    // pageType shortcut
-    if (pageType === PageType.Channel) return getYouTubeVideoIDFromDocument();
-    // clips should never skip, going from clip to full video has no indications.
-    if (url.includes("youtube.com/clip/")) return null;
-    // skip to document and don't hide if on /embed/
-    if (url.includes("/embed/") && url.includes("youtube.com")) return getYouTubeVideoIDFromDocument(false, PageType.Embed);
-    // skip to URL if matches youtube watch or invidious or matches youtube pattern
-    if ((!url.includes("youtube.com")) || url.includes("/watch") || url.includes("/shorts/") || url.includes("playlist")) return getYouTubeVideoIDFromURL(url);
-    // skip to document if matches pattern
-    if (url.includes("/channel/") || url.includes("/user/") || url.includes("/c/")) return getYouTubeVideoIDFromDocument(true, PageType.Channel);
-    // not sure, try URL then document
-    return getYouTubeVideoIDFromURL(url) || getYouTubeVideoIDFromDocument(false);
-}
-
-function getYouTubeVideoIDFromDocument(hideIcon = true, pageHint = PageType.Watch): string {
-    const selector = "a.ytp-title-link[data-sessionlink='feature=player-title']";
-    // get ID from document (channel trailer / embedded playlist)
-    const element = pageHint === PageType.Embed ? document.querySelector(selector)
-        : video?.parentElement?.parentElement?.querySelector(selector);
-    const videoURL = element?.getAttribute("href");
-    if (videoURL) {
-        onInvidious = hideIcon;
-        // if href found, hint was correct
-        pageType = pageHint;
-        return getYouTubeVideoIDFromURL(videoURL);
-    } else {
-        return null;
-    }
-}
-
-function getYouTubeVideoIDFromURL(url: string): string {
-    if(url.startsWith("https://www.youtube.com/tv#/")) url = url.replace("#", "");
-
-    //Attempt to parse url
-    let urlObject: URL = null;
-    try {
-        urlObject = new URL(url);
-    } catch (e) {
-        console.error("[SB] Unable to parse URL: " + url);
-        return null;
-    }
-
-    // Check if valid hostname
-    if (Config.config && Config.config.invidiousInstances.includes(urlObject.host)) {
-        onInvidious = true;
-    } else if (urlObject.host === "m.youtube.com") {
-        onMobileYouTube = true;
-    } else if (!["m.youtube.com", "www.youtube.com", "www.youtube-nocookie.com", "music.youtube.com"].includes(urlObject.host)) {
-        if (!Config.config) {
-            // Call this later, in case this is an Invidious tab
-            utils.wait(() => Config.config !== null).then(() => videoIDChange(getYouTubeVideoIDFromURL(url)));
-        }
-
-        return null;
-    } else {
-        onInvidious = false;
-    }
-
-    //Get ID from searchParam
-    if (urlObject.searchParams.has("v") && ["/watch", "/watch/"].includes(urlObject.pathname) || urlObject.pathname.startsWith("/tv/watch")) {
-        const id = urlObject.searchParams.get("v");
-        return id.length == 11 ? id : null;
-    } else if (urlObject.pathname.startsWith("/embed/") || urlObject.pathname.startsWith("/shorts/")) {
-        try {
-            const id = urlObject.pathname.split("/")[2]
-            if (id?.length >=11 ) return id.slice(0, 11);
-        } catch (e) {
-            console.error("[SB] Video ID not valid for " + url);
-            return null;
-        }
-    }
-    return null;
-}
-
-/**
- * This function is required on mobile YouTube and will keep getting called whenever the preview bar disapears
- */
-function updatePreviewBarPositionMobile(parent: HTMLElement) {
-    if (document.getElementById("previewbar") === null) {
-        previewBar.createElement(parent);
-    }
+function selectSegment(UUID: SegmentUUID): void {
+    selectedSegment = UUID;
+    updatePreviewBar();
 }
 
 function updatePreviewBar(): void {
     if (previewBar === null) return;
 
-    if (isAdPlaying) {
+    if (getIsAdPlaying()) {
         previewBar.clear();
         return;
     }
 
-    if (video === null) return;
+    if (getVideo() === null) return;
 
     const hashParams = getHashParams();
+    const requiredSegment = hashParams?.requiredSegment as SegmentUUID || undefined;
     const previewBarSegments: PreviewBarSegment[] = [];
     if (sponsorTimes) {
         sponsorTimes.forEach((segment) => {
@@ -1362,7 +1418,8 @@ function updatePreviewBar(): void {
                 showLarger: segment.actionType === ActionType.Poi,
                 description: segment.description,
                 source: segment.source,
-                requiredSegment: hashParams.requiredSegment && segment.UUID === hashParams.requiredSegment
+                requiredSegment: requiredSegment && (segment.UUID === requiredSegment || segment.UUID?.startsWith(requiredSegment)),
+                selectedSegment: selectedSegment && segment.UUID === selectedSegment
             });
         });
     }
@@ -1379,49 +1436,21 @@ function updatePreviewBar(): void {
         });
     });
 
-    previewBar.set(previewBarSegments.filter((segment) => segment.actionType !== ActionType.Full), video?.duration)
-    if (video) updateActiveSegment(video.currentTime);
+    previewBar.set(previewBarSegments.filter((segment) => segment.actionType !== ActionType.Full), getVideoDuration())
+    if (getVideo()) updateActiveSegment(getCurrentTime());
 
     if (Config.config.showTimeWithSkips) {
         const skippedDuration = utils.getTimestampsDuration(previewBarSegments
-            .filter(({actionType}) => actionType !== ActionType.Chapter)
+            .filter(({actionType}) => ![ActionType.Mute, ActionType.Chapter].includes(actionType))
             .map(({segment}) => segment));
 
         showTimeWithoutSkips(skippedDuration);
     }
-
-    // Update last video id
-    lastPreviewBarUpdate = sponsorVideoID;
 }
 
 //checks if this channel is whitelisted, should be done only after the channelID has been loaded
-async function whitelistCheck() {
+async function channelIDChange(channelIDInfo: ChannelIDInfo) {
     const whitelistedChannels = Config.config.whitelistedChannels;
-
-    try {
-        await utils.wait(() => channelIDInfo.status === ChannelIDStatus.Found, 6000, 20);
-
-        // If found, continue on, it was set by the listener
-    } catch (e) {
-        // Try fallback
-        const channelIDFallback = (document.querySelector("a.ytd-video-owner-renderer") // YouTube
-            ?? document.querySelector("a.ytp-title-channel-logo") // YouTube Embed
-            ?? document.querySelector(".channel-profile #channel-name")?.parentElement.parentElement // Invidious
-            ?? document.querySelector("a.slim-owner-icon-and-title")) // Mobile YouTube
-                ?.getAttribute("href")?.match(/\/(?:channel|c|user)\/(UC[a-zA-Z0-9_-]{22}|[a-zA-Z0-9_-]+)/)?.[1];
-
-        if (channelIDFallback) {
-            channelIDInfo = {
-                status: ChannelIDStatus.Found,
-                id: channelIDFallback
-            };
-        } else {
-            channelIDInfo = {
-                status: ChannelIDStatus.Failed,
-                id: null
-            };
-        }
-    }
 
     //see if this is a whitelisted channel
     if (whitelistedChannels != undefined &&
@@ -1431,6 +1460,44 @@ async function whitelistCheck() {
 
     // check if the start of segments were missed
     if (Config.config.forceChannelCheck && sponsorTimes?.length > 0) startSkipScheduleCheckingForStartSponsors();
+}
+
+function videoElementChange(newVideo: boolean, video: HTMLVideoElement): void {
+    waitFor(() => Config.isReady()).then(() => {
+        if (newVideo) {
+            setupVideoListeners(video);
+            setupSkipButtonControlBar();
+            setupCategoryPill();
+        }
+        
+        updatePreviewBar();
+        checkPreviewbarState();
+    
+        // Incase the page is still transitioning, check again in a few seconds
+        setTimeout(checkPreviewbarState, 100);
+        setTimeout(checkPreviewbarState, 1000);
+        setTimeout(checkPreviewbarState, 5000);
+    })
+}
+
+let checkingPreviewbarAgain = false;
+function checkPreviewbarState(): void {
+    if (!getPreviewBarAttachElement() && !checkingPreviewbarAgain && getVideo() && getVideoID()) {
+        checkingPreviewbarAgain = true;
+        setTimeout(() => {
+            checkingPreviewbarAgain = false;
+            checkPreviewbarState();
+        }, 500);
+
+        return;
+    }
+
+    if (previewBar && !getPreviewBarAttachElement()?.contains(previewBar.container)) {
+        previewBar.remove();
+        previewBar = null;
+    }
+
+    createPreviewBar();
 }
 
 /**
@@ -1521,7 +1588,7 @@ function getLatestEndTimeIndex(sponsorTimes: SponsorTime[], index: number, hideH
         const currentSegment = sponsorTimes[i].segment;
         const latestEndTime = sponsorTimes[latestEndTimeIndex].segment[1];
 
-        if (currentSegment[0] <= latestEndTime && currentSegment[1] > latestEndTime
+        if (currentSegment[0] - skipBuffer <= latestEndTime && currentSegment[1] > latestEndTime
             && (!hideHiddenSponsors || sponsorTimes[i].hidden === SponsorHideType.Visible)
             && shouldAutoSkip(sponsorTimes[i])
             && sponsorTimes[i].actionType === ActionType.Skip) {
@@ -1555,6 +1622,15 @@ function getStartTimes(sponsorTimes: SponsorTime[], includeIntersectingSegments:
     const includedTimes: ScheduledTime[] = [];
     const scheduledTimes: number[] = [];
 
+    const shouldIncludeTime = (segment: ScheduledTime ) => (minimum === undefined
+        || ((includeNonIntersectingSegments && segment.scheduledTime >= minimum)
+            || (includeIntersectingSegments && segment.scheduledTime < minimum
+                    && segment.segment[1] > minimum && shouldSkip(segment)))) // Only include intersecting skippable segments
+        && (!hideHiddenSponsors || segment.hidden === SponsorHideType.Visible)
+        && segment.segment.length === 2
+        && segment.actionType !== ActionType.Poi
+        && segment.actionType !== ActionType.Full;
+
     const possibleTimes = sponsorTimes.map((sponsorTime) => ({
         ...sponsorTime,
         scheduledTime: sponsorTime.segment[0]
@@ -1562,7 +1638,8 @@ function getStartTimes(sponsorTimes: SponsorTime[], includeIntersectingSegments:
 
     // Schedule at the end time to know when to unmute and remove title from seek bar
     sponsorTimes.forEach(sponsorTime => {
-        if (!possibleTimes.some((time) => sponsorTime.segment[1] === time.scheduledTime)) {
+        if (!possibleTimes.some((time) => sponsorTime.segment[1] === time.scheduledTime && shouldIncludeTime(time))
+            && (minimum === undefined || sponsorTime.segment[1] > minimum)) {
             possibleTimes.push({
                 ...sponsorTime,
                 scheduledTime: sponsorTime.segment[1]
@@ -1571,13 +1648,7 @@ function getStartTimes(sponsorTimes: SponsorTime[], includeIntersectingSegments:
     });
 
     for (let i = 0; i < possibleTimes.length; i++) {
-        if ((minimum === undefined
-                || ((includeNonIntersectingSegments && possibleTimes[i].scheduledTime >= minimum)
-                    || (includeIntersectingSegments && possibleTimes[i].scheduledTime < minimum && possibleTimes[i].segment[1] > minimum)))
-                && (!hideHiddenSponsors || possibleTimes[i].hidden === SponsorHideType.Visible)
-                && possibleTimes[i].segment.length === 2
-                && possibleTimes[i].actionType !== ActionType.Poi) {
-
+        if (shouldIncludeTime(possibleTimes[i])) {
             scheduledTimes.push(possibleTimes[i].scheduledTime);
             includedTimes.push(possibleTimes[i]);
         }
@@ -1592,16 +1663,24 @@ function getStartTimes(sponsorTimes: SponsorTime[], includeIntersectingSegments:
  * @param time
  */
 function previewTime(time: number, unpause = true) {
-    video.currentTime = time;
+    previewedSegment = true;
+    setCurrentTime(time);
 
     // Unpause the video if needed
-    if (unpause && video.paused){
-        video.play();
+    if (unpause && getVideo().paused){
+        getVideo().play();
     }
 }
 
 //send telemetry and count skip
 function sendTelemetryAndCount(skippingSegments: SponsorTime[], secondsSkipped: number, fullSkip: boolean) {
+    for (const segment of skippingSegments) {
+        if (!previewedSegment && sponsorTimesSubmitting.some((s) => s.segment === segment.segment)) {
+            // Count that as a previewed segment
+            previewedSegment = true;
+        }
+    }
+
     if (!Config.config.trackViewCount || (!Config.config.trackViewCountInPrivate && chrome.extension.inIncognitoContext)) return;
 
     let counted = false;
@@ -1617,7 +1696,7 @@ function sendTelemetryAndCount(skippingSegments: SponsorTime[], secondsSkipped: 
                 counted = true;
             }
 
-            if (fullSkip) utils.asyncRequestToServer("POST", "/api/viewedVideoSponsorTime?UUID=" + segment.UUID);
+            if (fullSkip) asyncRequestToServer("POST", "/api/viewedVideoSponsorTime?UUID=" + segment.UUID);
         }
     }
 }
@@ -1628,21 +1707,33 @@ function skipToTime({v, skipTime, skippingSegments, openNotice, forceAutoSkip, u
 
     // There will only be one submission if it is manual skip
     const autoSkip: boolean = forceAutoSkip || shouldAutoSkip(skippingSegments[0]);
+    const isSubmittingSegment = sponsorTimesSubmitting.some((time) => time.segment === skippingSegments[0].segment);
 
-    if ((autoSkip || sponsorTimesSubmitting.some((time) => time.segment === skippingSegments[0].segment))
-            && v.currentTime !== skipTime[1]) {
+    if ((autoSkip || isSubmittingSegment)
+            && getCurrentTime() !== skipTime[1]) {
         switch(skippingSegments[0].actionType) {
             case ActionType.Poi:
             case ActionType.Skip: {
                 // Fix for looped videos not working when skipping to the end #426
                 // for some reason you also can't skip to 1 second before the end
-                if (v.loop && v.duration > 1 && skipTime[1] >= v.duration - 1) {
-                    v.currentTime = 0;
-                } else if (navigator.vendor === "Apple Computer, Inc." && v.duration > 1 && skipTime[1] >= v.duration) {
+                if (v.loop && getVideoDuration() > 1 && skipTime[1] >= getVideoDuration() - 1) {
+                    setCurrentTime(0);
+                } else if (getVideoDuration() > 1 && skipTime[1] >= getVideoDuration()
+                        && (navigator.vendor === "Apple Computer, Inc." || isPlayingPlaylist())) {
                     // MacOS will loop otherwise #1027
-                    v.currentTime = v.duration - 0.001;
+                    // Sometimes playlists loop too #1804
+                    setCurrentTime(getVideoDuration() - 0.001);
+                } else if (getVideoDuration() > 1 && Math.abs(skipTime[1] - getVideoDuration()) < endTimeSkipBuffer
+                    && isFirefoxOrSafari() && !isSafari()) {
+                    setCurrentTime(getVideoDuration());
                 } else {
-                    v.currentTime = skipTime[1];
+                    if (inMuteSegment(skipTime[1], true)) {
+                        // Make sure not to mute if skipping into a mute segment
+                        v.muted = true;
+                        videoMuted = true;
+                    }
+
+                    setCurrentTime(skipTime[1]);
                 }
 
                 break;
@@ -1657,27 +1748,31 @@ function skipToTime({v, skipTime, skippingSegments, openNotice, forceAutoSkip, u
         }
     }
 
-    if (autoSkip && Config.config.audioNotificationOnSkip) {
-        const beep = new Audio(chrome.runtime.getURL("icons/beep.ogg"));
-        beep.volume = video.volume * 0.1;
+    if (autoSkip && Config.config.audioNotificationOnSkip
+            && !isSubmittingSegment && !getVideo()?.muted) {
+        const beep = new Audio(chrome.runtime.getURL("icons/beep.oga"));
+        beep.volume = getVideo().volume * 0.1;
         const oldMetadata = navigator.mediaSession.metadata
         beep.play();
         beep.addEventListener("ended", () => {
             navigator.mediaSession.metadata = null;
-            setTimeout(() =>
-                navigator.mediaSession.metadata = oldMetadata
-            );
+            setTimeout(() => {
+                navigator.mediaSession.metadata = oldMetadata;
+                beep.remove();
+            });
         })
     }
 
     if (!autoSkip
             && skippingSegments.length === 1
             && skippingSegments[0].actionType === ActionType.Poi) {
-        skipButtonControlBar.enable(skippingSegments[0]);
-        if (onMobileYouTube || Config.config.skipKeybind == null) skipButtonControlBar.setShowKeybindHint(false);
-
-        activeSkipKeybindElement?.setShowKeybindHint(false);
-        activeSkipKeybindElement = skipButtonControlBar;
+        waitFor(() => skipButtonControlBar).then(() => {
+            skipButtonControlBar.enable(skippingSegments[0]);
+            if (isOnMobileYouTube() || Config.config.skipKeybind == null) skipButtonControlBar.setShowKeybindHint(false);
+    
+            activeSkipKeybindElement?.setShowKeybindHint(false);
+            activeSkipKeybindElement = skipButtonControlBar;
+        })
     } else {
         if (openNotice) {
             //send out the message saying that a sponsor message was skipped
@@ -1698,7 +1793,7 @@ function skipToTime({v, skipTime, skippingSegments, openNotice, forceAutoSkip, u
     }
 
     //send telemetry that a this sponsor was skipped
-    if (autoSkip) sendTelemetryAndCount(skippingSegments, skipTime[1] - skipTime[0], true);
+    if (autoSkip || isSubmittingSegment) sendTelemetryAndCount(skippingSegments, skipTime[1] - skipTime[0], true);
 }
 
 function createSkipNotice(skippingSegments: SponsorTime[], autoSkip: boolean, unskipTime: number, startReskip: boolean) {
@@ -1710,37 +1805,53 @@ function createSkipNotice(skippingSegments: SponsorTime[], autoSkip: boolean, un
         }
     }
 
-    const newSkipNotice = new SkipNotice(skippingSegments, autoSkip, skipNoticeContentContainer, unskipTime, startReskip);
-    if (onMobileYouTube || Config.config.skipKeybind == null) newSkipNotice.setShowKeybindHint(false);
+    const upcomingNoticeShown = !!upcomingNotice && !upcomingNotice.closed;
+
+    const newSkipNotice = new SkipNotice(skippingSegments, autoSkip, skipNoticeContentContainer, () => {
+        upcomingNotice?.close();
+        upcomingNotice = null;
+    }, unskipTime, startReskip, upcomingNoticeShown);
+    if (isOnMobileYouTube() || Config.config.skipKeybind == null) newSkipNotice.setShowKeybindHint(false);
     skipNotices.push(newSkipNotice);
 
     activeSkipKeybindElement?.setShowKeybindHint(false);
     activeSkipKeybindElement = newSkipNotice;
 }
 
+function createUpcomingNotice(skippingSegments: SponsorTime[], timeLeft: number, autoSkip: boolean): void {
+    if (upcomingNotice 
+            && !upcomingNotice.closed
+            && upcomingNotice.sameNotice(skippingSegments)) {
+        return;
+    }
+
+    upcomingNotice?.close();
+    upcomingNotice = new UpcomingNotice(skippingSegments, skipNoticeContentContainer, timeLeft / 1000, autoSkip);
+}
+
 function unskipSponsorTime(segment: SponsorTime, unskipTime: number = null, forceSeek = false) {
     if (segment.actionType === ActionType.Mute) {
-        video.muted = false;
+        getVideo().muted = false;
         videoMuted = false;
     }
 
     if (forceSeek || segment.actionType === ActionType.Skip) {
         //add a tiny bit of time to make sure it is not skipped again
-        video.currentTime = unskipTime ?? segment.segment[0] + 0.001;
+        setCurrentTime(unskipTime ?? segment.segment[0] + 0.001);
     }
 
 }
 
 function reskipSponsorTime(segment: SponsorTime, forceSeek = false) {
     if (segment.actionType === ActionType.Mute && !forceSeek) {
-        video.muted = true;
+        getVideo().muted = true;
         videoMuted = true;
     } else {
-        const skippedTime = Math.max(segment.segment[1] - video.currentTime, 0);
+        const skippedTime = Math.max(segment.segment[1] - getCurrentTime(), 0);
         const segmentDuration = segment.segment[1] - segment.segment[0];
         const fullSkip = skippedTime / segmentDuration > manualSkipPercentCount;
 
-        video.currentTime = segment.segment[1];
+        setCurrentTime(segment.segment[1]);
         sendTelemetryAndCount([segment], segment.actionType !== ActionType.Chapter ? skippedTime : 0, fullSkip);
         startSponsorSchedule(true, segment.segment[1], false);
     }
@@ -1766,7 +1877,7 @@ function createButton(baseID: string, title: string, callback: () => void, image
     newButton.draggable = isDraggable;
     newButtonImage.id = baseID + "Image";
     newButtonImage.className = "playerButtonImage";
-    newButtonImage.src = chrome.extension.getURL("icons/" + imageName);
+    newButtonImage.src = chrome.runtime.getURL("icons/" + imageName);
 
     // Append image to button
     newButton.appendChild(newButtonImage);
@@ -1788,14 +1899,16 @@ function shouldAutoSkip(segment: SponsorTime): boolean {
     return (!Config.config.manualSkipOnFullVideo || !sponsorTimes?.some((s) => s.category === segment.category && s.actionType === ActionType.Full))
         && (utils.getCategorySelection(segment.category)?.option === CategorySkipOption.AutoSkip ||
             (Config.config.autoSkipOnMusicVideos && sponsorTimes?.some((s) => s.category === "music_offtopic")
-                && segment.actionType !== ActionType.Poi));
+                && segment.actionType === ActionType.Skip)
+            || sponsorTimesSubmitting.some((s) => s.segment === segment.segment));
 }
 
 function shouldSkip(segment: SponsorTime): boolean {
     return (segment.actionType !== ActionType.Full
             && segment.source !== SponsorSourceType.YouTube
             && utils.getCategorySelection(segment.category)?.option !== CategorySkipOption.ShowOverlay)
-            || (Config.config.autoSkipOnMusicVideos && sponsorTimes?.some((s) => s.category === "music_offtopic"));
+            || (Config.config.autoSkipOnMusicVideos && sponsorTimes?.some((s) => s.category === "music_offtopic")
+                && segment.actionType === ActionType.Skip);
 }
 
 /** Creates any missing buttons on the YouTube player if possible. */
@@ -1806,11 +1919,11 @@ async function createButtons(): Promise<void> {
     createButton("startSegment", "sponsorStart", () => startOrEndTimingNewSegment(), "PlayerStartIconSponsorBlocker.svg");
     createButton("cancelSegment", "sponsorCancel", () => cancelCreatingSegment(), "PlayerCancelSegmentIconSponsorBlocker.svg");
     createButton("delete", "clearTimes", () => clearSponsorTimes(), "PlayerDeleteIconSponsorBlocker.svg");
-    createButton("submit", "SubmitTimes", () => submitSponsorTimes(), "PlayerUploadIconSponsorBlocker.svg");
+    createButton("submit", "OpenSubmissionMenu", () => openSubmissionMenu(), "PlayerUploadIconSponsorBlocker.svg");
     createButton("info", "openPopup", () => openInfoMenu(), "PlayerInfoIconSponsorBlocker.svg");
 
     const controlsContainer = getControls();
-    if (Config.config.autoHideInfoButton && !onInvidious && controlsContainer
+    if (Config.config.autoHideInfoButton && !isOnInvidious() && controlsContainer
             && playerButtons["info"]?.button && !controlsWithEventListeners.includes(controlsContainer)) {
         controlsWithEventListeners.push(controlsContainer);
 
@@ -1821,14 +1934,14 @@ async function createButtons(): Promise<void> {
 /** Creates any missing buttons on the player and updates their visiblity. */
 async function updateVisibilityOfPlayerControlsButton(): Promise<void> {
     // Not on a proper video yet
-    if (!sponsorVideoID || onMobileYouTube) return;
+    if (!getVideoID() || isOnMobileYouTube()) return;
 
     await createButtons();
 
     updateEditButtonsOnPlayer();
 
     // Don't show the info button on embeds
-    if (Config.config.hideInfoButtonPlayerControls || document.URL.includes("/embed/") || onInvidious
+    if (Config.config.hideInfoButtonPlayerControls || document.URL.includes("/embed/") || isOnInvidious()
         || document.getElementById("sponsorBlockPopupContainer") != null) {
         playerButtons.info.button.style.display = "none";
     } else {
@@ -1839,9 +1952,9 @@ async function updateVisibilityOfPlayerControlsButton(): Promise<void> {
 /** Updates the visibility of buttons on the player related to creating segments. */
 function updateEditButtonsOnPlayer(): void {
     // Don't try to update the buttons if we aren't on a YouTube video page
-    if (!sponsorVideoID || onMobileYouTube) return;
+    if (!getVideoID() || isOnMobileYouTube()) return;
 
-    const buttonsEnabled = !(Config.config.hideVideoPlayerControls || onInvidious);
+    const buttonsEnabled = !(Config.config.hideVideoPlayerControls || isOnInvidious());
 
     let creatingSegment = false;
     let submitButtonVisible = false;
@@ -1864,10 +1977,10 @@ function updateEditButtonsOnPlayer(): void {
 
     if (buttonsEnabled) {
         if (creatingSegment) {
-            playerButtons.startSegment.image.src = chrome.extension.getURL("icons/PlayerStopIconSponsorBlocker.svg");
+            playerButtons.startSegment.image.src = chrome.runtime.getURL("icons/PlayerStopIconSponsorBlocker.svg");
             playerButtons.startSegment.button.setAttribute("title", chrome.i18n.getMessage("sponsorEnd"));
         } else {
-            playerButtons.startSegment.image.src = chrome.extension.getURL("icons/PlayerStartIconSponsorBlocker.svg");
+            playerButtons.startSegment.image.src = chrome.runtime.getURL("icons/PlayerStartIconSponsorBlocker.svg");
             playerButtons.startSegment.button.setAttribute("title", chrome.i18n.getMessage("sponsorStart"));
         }
     }
@@ -1878,7 +1991,7 @@ function updateEditButtonsOnPlayer(): void {
 
 /**
  * Used for submitting. This will use the HTML displayed number when required as the video's
- * current time is out of date while scrubbing or at the end of the video. This is not needed
+ * current time is out of date while scrubbing or at the end of the getVideo(). This is not needed
  * for sponsor skipping as the video is not playing during these times.
  */
 function getRealCurrentTime(): number {
@@ -1888,18 +2001,19 @@ function getRealCurrentTime(): number {
 
     if (playButtonSVGData === replaceSVGData) {
         // At the end of the video
-        return video?.duration;
+        return getVideoDuration();
     } else {
-        return video.currentTime;
+        return getCurrentTime();
     }
 }
 
 function startOrEndTimingNewSegment() {
+    verifyCurrentTime();
     const roundedTime = Math.round((getRealCurrentTime() + Number.EPSILON) * 1000) / 1000;
     if (!isSegmentCreationInProgress()) {
         sponsorTimesSubmitting.push({
             segment: [roundedTime],
-            UUID: GenericUtils.generateUserID() as SegmentUUID,
+            UUID: generateUserID() as SegmentUUID,
             category: Config.config.defaultCategory,
             actionType: ActionType.Skip,
             source: SponsorSourceType.Local
@@ -1915,18 +2029,18 @@ function startOrEndTimingNewSegment() {
     }
 
     // Save the newly created segment
-    Config.config.unsubmittedSegments[sponsorVideoID] = sponsorTimesSubmitting;
-    Config.forceSyncUpdate("unsubmittedSegments");
+    Config.local.unsubmittedSegments[getVideoID()] = sponsorTimesSubmitting;
+    Config.forceLocalUpdate("unsubmittedSegments");
 
     // Make sure they know if someone has already submitted something it while they were watching
-    sponsorsLookup();
+    sponsorsLookup(true, true);
 
     updateEditButtonsOnPlayer();
     updateSponsorTimesSubmitting(false);
 
     importExistingChapters(false);
 
-    if (lastResponseStatus !== 200 && lastResponseStatus !== 404 
+    if (lastResponseStatus !== 200 && lastResponseStatus !== 404
             && !shownSegmentFailedToFetchWarning && Config.config.showSegmentFailedToFetchWarning) {
         alert(chrome.i18n.getMessage("segmentFetchFailureWarning"));
 
@@ -1948,13 +2062,13 @@ function cancelCreatingSegment() {
     if (isSegmentCreationInProgress()) {
         if (sponsorTimesSubmitting.length > 1) {  // If there's more than one segment: remove last
             sponsorTimesSubmitting.pop();
-            Config.config.unsubmittedSegments[sponsorVideoID] = sponsorTimesSubmitting;
+            Config.local.unsubmittedSegments[getVideoID()] = sponsorTimesSubmitting;
         } else {  // Otherwise delete the video entry & close submission menu
             resetSponsorSubmissionNotice();
             sponsorTimesSubmitting = [];
-            delete Config.config.unsubmittedSegments[sponsorVideoID];
+            delete Config.local.unsubmittedSegments[getVideoID()];
         }
-        Config.forceSyncUpdate("unsubmittedSegments");
+        Config.forceLocalUpdate("unsubmittedSegments");
     }
 
     updateEditButtonsOnPlayer();
@@ -1962,7 +2076,7 @@ function cancelCreatingSegment() {
 }
 
 function updateSponsorTimesSubmitting(getFromConfig = true) {
-    const segmentTimes = Config.config.unsubmittedSegments[sponsorVideoID];
+    const segmentTimes = Config.local.unsubmittedSegments[getVideoID()];
 
     //see if this data should be saved in the sponsorTimesSubmitting variable
     if (getFromConfig && segmentTimes != undefined) {
@@ -1980,6 +2094,9 @@ function updateSponsorTimesSubmitting(getFromConfig = true) {
         }
 
         if (sponsorTimesSubmitting.length > 0) {
+            // Assume they already previewed a segment
+            previewedSegment = true;
+
             importExistingChapters(true);
         }
     }
@@ -1987,7 +2104,7 @@ function updateSponsorTimesSubmitting(getFromConfig = true) {
     updatePreviewBar();
 
     // Restart skipping schedule
-    if (video !== null) startSponsorSchedule();
+    if (getVideo() !== null) startSponsorSchedule();
 
     if (submissionNotice !== null) {
         submissionNotice.update();
@@ -2007,30 +2124,74 @@ function openInfoMenu() {
     //hide info button
     if (playerButtons.info) playerButtons.info.button.style.display = "none";
 
-
     const popup = document.createElement("div");
     popup.id = "sponsorBlockPopupContainer";
 
     const frame = document.createElement("iframe");
     frame.width = "374";
     frame.height = "500";
-    frame.addEventListener("load", () => frame.contentWindow.postMessage("", "*"));
-    frame.src = chrome.extension.getURL("popup.html");
+    frame.style.borderRadius = "12px";
+    frame.addEventListener("load", async () => {
+        frame.contentWindow.postMessage("", "*");
+
+        // To support userstyles applying to the popup
+        const stylusStyle = document.querySelector(".stylus");
+        if (stylusStyle) {
+            frame.contentWindow.postMessage({
+                type: "style",
+                css: stylusStyle.textContent
+            }, "*");
+        }
+
+        const enhancerStyle = document.getElementById("efyt-theme");
+        if (enhancerStyle) {
+            const enhancerStyleVariables = document.getElementById("efyt-theme-variables");
+            if (enhancerStyleVariables) {
+                const enhancerCss = await fetch(enhancerStyle.getAttribute("href")).then((response) => response.text());
+                const enhancerVariablesCss = await fetch(enhancerStyleVariables.getAttribute("href")).then((response) => response.text());
+
+                if (enhancerCss && enhancerVariablesCss) {
+                    frame.contentWindow.postMessage({
+                        type: "style",
+                        // Image needs needs to reference the full url now
+                        css: enhancerCss.replace("./images/youtube-deep-dark/IconSponsorBlocker256px.png",
+                            "https://raw.githubusercontent.com/RaitaroH/YouTube-DeepDark/master/YT_Images/IconSponsorBlocker256px.png")
+                            + enhancerVariablesCss
+                    }, "*");
+                }
+            }
+        }
+    });
+    frame.src = chrome.runtime.getURL("popup.html");
     popup.appendChild(frame);
 
-    const parentNodes = document.querySelectorAll("#secondary-inner");
-    let parentNode = null;
-    for (let i = 0; i < parentNodes.length; i++) {
-        if (parentNodes[i].firstElementChild !== null) {
-            parentNode = parentNodes[i];
+    const elemHasChild = (elements: NodeListOf<HTMLElement>): Element => {
+        let parentNode: Element;
+        for (const node of elements) {
+            if (node.firstElementChild !== null) {
+                parentNode = node;
+            }
         }
-    }
-    if (parentNode == null) {
-        //old youtube theme
-        parentNode = document.getElementById("watch7-sidebar-contents");
+        return parentNode
     }
 
-    parentNode.insertBefore(popup, parentNode.firstChild);
+    const parentNodeOptions = [{
+        // YouTube
+        selector: "#secondary-inner",
+        hasChildCheck: true
+    }, {
+        // old youtube theme
+        selector: "#watch7-sidebar-contents",
+    }];
+    for (const option of parentNodeOptions) {
+        const allElements = document.querySelectorAll(option.selector) as NodeListOf<HTMLElement>;
+        const el = option.hasChildCheck ? elemHasChild(allElements) : allElements[0];
+
+        if (el) {
+            if (option.hasChildCheck) el.insertBefore(popup, el.firstChild);
+            break;
+        }
+    }
 }
 
 function closeInfoMenu() {
@@ -2046,9 +2207,9 @@ function closeInfoMenu() {
 }
 
 function clearSponsorTimes() {
-    const currentVideoID = sponsorVideoID;
+    const currentVideoID = getVideoID();
 
-    const sponsorTimes = Config.config.unsubmittedSegments[currentVideoID];
+    const sponsorTimes = Config.local.unsubmittedSegments[currentVideoID];
 
     if (sponsorTimes != undefined && sponsorTimes.length > 0) {
         const confirmMessage = chrome.i18n.getMessage("clearThis") + getSegmentsMessage(sponsorTimes)
@@ -2058,8 +2219,8 @@ function clearSponsorTimes() {
         resetSponsorSubmissionNotice();
 
         //clear the sponsor times
-        delete Config.config.unsubmittedSegments[currentVideoID];
-        Config.forceSyncUpdate("unsubmittedSegments");
+        delete Config.local.unsubmittedSegments[currentVideoID];
+        Config.forceLocalUpdate("unsubmittedSegments");
 
         //clear sponsor times submitting
         sponsorTimesSubmitting = [];
@@ -2085,10 +2246,10 @@ async function vote(type: number, UUID: SegmentUUID, category?: Category, skipNo
                 //success (treat rate limits as a success)
                 skipNotice.afterVote.bind(skipNotice)(utils.getSponsorTimeFromUUID(sponsorTimes, UUID), type, category);
             } else if (response.successType == -1) {
-                if (response.statusCode === 403 && response.responseText.startsWith("Vote rejected due to a warning from a moderator.")) {
+                if (response.statusCode === 403 && response.responseText.startsWith("Vote rejected due to a tip from a moderator.")) {
                     openWarningDialog(skipNoticeContentContainer);
                 } else {
-                    skipNotice.setNoticeInfoMessage.bind(skipNotice)(GenericUtils.getErrorMessage(response.statusCode, response.responseText))
+                    skipNotice.setNoticeInfoMessage.bind(skipNotice)(getErrorMessage(response.statusCode, response.responseText))
                 }
 
                 skipNotice.resetVoteButtonInfo.bind(skipNotice)();
@@ -2099,11 +2260,11 @@ async function vote(type: number, UUID: SegmentUUID, category?: Category, skipNo
     return response;
 }
 
-async function voteAsync(type: number, UUID: SegmentUUID, category?: Category): Promise<VoteResponse> {
+async function voteAsync(type: number, UUID: SegmentUUID, category?: Category): Promise<VoteResponse | undefined> {
     const sponsorIndex = utils.getSponsorIndexFromUUID(sponsorTimes, UUID);
 
     // Don't vote for preview sponsors
-    if (sponsorIndex == -1 || sponsorTimes[sponsorIndex].source !== SponsorSourceType.Server) return;
+    if (sponsorIndex == -1 || sponsorTimes[sponsorIndex].source !== SponsorSourceType.Server) return Promise.resolve(undefined);
 
     // See if the local time saved count and skip count should be saved
     if (type === 0 && sponsorSkipped[sponsorIndex] || type === 1 && !sponsorSkipped[sponsorIndex]) {
@@ -2140,7 +2301,7 @@ async function voteAsync(type: number, UUID: SegmentUUID, category?: Category): 
                     }
 
                     if (!category && !Config.config.isVip) {
-                        utils.addHiddenSegment(sponsorVideoID, segment.UUID, segment.hidden);
+                        utils.addHiddenSegment(getVideoID(), segment.UUID, segment.hidden);
                     }
 
                     updatePreviewBar();
@@ -2173,42 +2334,75 @@ function resetSponsorSubmissionNotice(callRef = true) {
     submissionNotice = null;
 }
 
-function submitSponsorTimes() {
+function closeSubmissionMenu() {
+    submissionNotice?.close();
+    submissionNotice = null;
+}
+
+function openSubmissionMenu() {
     if (submissionNotice !== null){
-        submissionNotice.close();
-        submissionNotice = null;
+        closeSubmissionMenu();
         return;
     }
 
     if (sponsorTimesSubmitting !== undefined && sponsorTimesSubmitting.length > 0) {
         submissionNotice = new SubmissionNotice(skipNoticeContentContainer, sendSubmitMessage);
     }
+}
+
+function previewRecentSegment() {
+    if (sponsorTimesSubmitting !== undefined && sponsorTimesSubmitting.length > 0) {
+        previewTime(sponsorTimesSubmitting[sponsorTimesSubmitting.length - 1].segment[0] - defaultPreviewTime);
+        
+        if (submissionNotice) {
+            submissionNotice.scrollToBottom();
+        }
+    }
+}
+
+function submitSegments() {
+    if (sponsorTimesSubmitting !== undefined
+            && sponsorTimesSubmitting.length > 0
+            && submissionNotice !== null) {
+        submissionNotice.submit();
+    }
 
 }
 
 //send the message to the background js
 //called after all the checks have been made that it's okay to do so
-async function sendSubmitMessage() {
+async function sendSubmitMessage(): Promise<boolean> {
+    // check if all segments are full video
+    const onlyFullVideo = sponsorTimesSubmitting.every((segment) => segment.actionType === ActionType.Full);
     // Block if submitting on a running livestream or premiere
-    if (isLivePremiere || isVisible(document.querySelector(".ytp-live-badge"))) {
+    if (!onlyFullVideo && (getIsLivePremiere() || isVisible(document.querySelector(".ytp-live-badge")))) {
         alert(chrome.i18n.getMessage("liveOrPremiere"));
-        return;
+        return false;
+    }
+
+    if (!previewedSegment 
+            && !sponsorTimesSubmitting.every((segment) => 
+                [ActionType.Full, ActionType.Chapter, ActionType.Poi].includes(segment.actionType) 
+                    || segment.segment[1] >= getVideoDuration()
+                    || segment.segment[0] === 0)) {
+        alert(`${chrome.i18n.getMessage("previewSegmentRequired")} ${keybindToString(Config.config.previewKeybind)}`);
+        return false;
     }
 
     // Add loading animation
-    playerButtons.submit.image.src = chrome.extension.getURL("icons/PlayerUploadIconSponsorBlocker.svg");
+    playerButtons.submit.image.src = chrome.runtime.getURL("icons/PlayerUploadIconSponsorBlocker.svg");
     const stopAnimation = AnimationUtils.applyLoadingAnimation(playerButtons.submit.button, 1, () => updateEditButtonsOnPlayer());
 
     //check if a sponsor exceeds the duration of the video
     for (let i = 0; i < sponsorTimesSubmitting.length; i++) {
-        if (sponsorTimesSubmitting[i].segment[1] > video.duration) {
-            sponsorTimesSubmitting[i].segment[1] = video.duration;
+        if (sponsorTimesSubmitting[i].segment[1] > getVideoDuration()) {
+            sponsorTimesSubmitting[i].segment[1] = getVideoDuration();
         }
     }
 
     //update sponsorTimes
-    Config.config.unsubmittedSegments[sponsorVideoID] = sponsorTimesSubmitting;
-    Config.forceSyncUpdate("unsubmittedSegments");
+    Config.local.unsubmittedSegments[getVideoID()] = sponsorTimesSubmitting;
+    Config.forceLocalUpdate("unsubmittedSegments");
 
     // Check to see if any of the submissions are below the minimum duration set
     if (Config.config.minDuration > 0) {
@@ -2218,16 +2412,16 @@ async function sendSubmitMessage() {
                 const confirmShort = chrome.i18n.getMessage("shortCheck") + "\n\n" +
                     getSegmentsMessage(sponsorTimesSubmitting);
 
-                if(!confirm(confirmShort)) return;
+                if(!confirm(confirmShort)) return false;
             }
         }
     }
 
-    const response = await utils.asyncRequestToServer("POST", "/api/skipSegments", {
-        videoID: sponsorVideoID,
+    const response = await asyncRequestToServer("POST", "/api/skipSegments", {
+        videoID: getVideoID(),
         userID: Config.config.userID,
         segments: sponsorTimesSubmitting,
-        videoDuration: video?.duration,
+        videoDuration: getVideoDuration(),
         userAgent: `${chrome.runtime.id}/v${chrome.runtime.getManifest().version}`
     });
 
@@ -2235,15 +2429,15 @@ async function sendSubmitMessage() {
         stopAnimation();
 
         // Remove segments from storage since they've already been submitted
-        delete Config.config.unsubmittedSegments[sponsorVideoID];
-        Config.forceSyncUpdate("unsubmittedSegments");
+        delete Config.local.unsubmittedSegments[getVideoID()];
+        Config.forceLocalUpdate("unsubmittedSegments");
 
         const newSegments = sponsorTimesSubmitting;
         try {
-            const recievedNewSegments = JSON.parse(response.responseText);
-            if (recievedNewSegments?.length === newSegments.length) {
-                for (let i = 0; i < recievedNewSegments.length; i++) {
-                    newSegments[i].UUID = recievedNewSegments[i].UUID;
+            const receivedNewSegments = JSON.parse(response.responseText);
+            if (receivedNewSegments?.length === newSegments.length) {
+                for (let i = 0; i < receivedNewSegments.length; i++) {
+                    newSegments[i].UUID = receivedNewSegments[i].UUID;
                     newSegments[i].source = SponsorSourceType.Server;
                 }
             }
@@ -2268,17 +2462,21 @@ async function sendSubmitMessage() {
         if (fullVideoSegment) {
             categoryPill?.setSegment(fullVideoSegment);
         }
+
+        return true;
     } else {
         // Show that the upload failed
         playerButtons.submit.button.style.animation = "unset";
-        playerButtons.submit.image.src = chrome.extension.getURL("icons/PlayerUploadFailedIconSponsorBlocker.svg");
+        playerButtons.submit.image.src = chrome.runtime.getURL("icons/PlayerUploadFailedIconSponsorBlocker.svg");
 
-        if (response.status === 403 && response.responseText.startsWith("Submission rejected due to a warning from a moderator.")) {
+        if (response.status === 403 && response.responseText.startsWith("Submission rejected due to a tip from a moderator.")) {
             openWarningDialog(skipNoticeContentContainer);
         } else {
-            alert(GenericUtils.getErrorMessage(response.status, response.responseText));
+            alert(getErrorMessage(response.status, response.responseText));
         }
     }
+
+    return false;
 }
 
 //get the message that visually displays the video times
@@ -2287,7 +2485,7 @@ function getSegmentsMessage(sponsorTimes: SponsorTime[]): string {
 
     for (let i = 0; i < sponsorTimes.length; i++) {
         for (let s = 0; s < sponsorTimes[i].segment.length; s++) {
-            let timeMessage = GenericUtils.getFormattedTime(sponsorTimes[i].segment[s]);
+            let timeMessage = getFormattedTime(sponsorTimes[i].segment[s]);
             //if this is an end time
             if (s == 1) {
                 timeMessage = " " + chrome.i18n.getMessage("to") + " " + timeMessage;
@@ -2303,113 +2501,79 @@ function getSegmentsMessage(sponsorTimes: SponsorTime[]): string {
     return sponsorTimesMessage;
 }
 
-function windowListenerHandler(event: MessageEvent): void {
-    const data = event.data;
-    const dataType = data.type;
-
-    if (data.source !== "sponsorblock" || document?.URL?.includes("youtube.com/clip/")) return;
-
-    if (dataType === "navigation" && data.videoID) {
-        pageType = data.pageType;
-
-        if (data.channelID) {
-            channelIDInfo = {
-                id: data.channelID,
-                status: ChannelIDStatus.Found
-            };
-        }
-
-        videoIDChange(data.videoID);
-    } else if (dataType === "ad") {
-        if (isAdPlaying != data.playing) {
-            isAdPlaying = data.playing
-            updatePreviewBar();
-            updateVisibilityOfPlayerControlsButton();
-        }
-    } else if (dataType === "data" && data.videoID) {
-        videoIDChange(data.videoID);
-
-        isLivePremiere = data.isLive || data.isPremiere
-    }
-}
-
 function updateActiveSegment(currentTime: number): void {
-    const activeSegments = previewBar?.updateChapterText(sponsorTimes, sponsorTimesSubmitting, currentTime);
+    previewBar?.updateChapterText(sponsorTimes, sponsorTimesSubmitting, currentTime);
+
     chrome.runtime.sendMessage({
         message: "time",
         time: currentTime
     });
-
-    const chapterSegments = activeSegments?.filter((segment) => segment.actionType === ActionType.Chapter);
-    if (chapterSegments?.length > 0) {
-        sendTelemetryAndCount(chapterSegments, 0, true);
-    }
 }
 
 function nextChapter(): void {
     const chapters = previewBar.unfilteredChapterGroups?.filter((time) => [ActionType.Chapter, null].includes(time.actionType));
     if (!chapters || chapters.length <= 0) return;
 
-    lastNextChapterKeybind.time = video.currentTime;
+    lastNextChapterKeybind.time = getCurrentTime();
     lastNextChapterKeybind.date = Date.now();
 
-    const nextChapter = chapters.findIndex((time) => time.segment[0] > video.currentTime);
+    const nextChapter = chapters.findIndex((time) => time.segment[0] > getCurrentTime());
     if (nextChapter !== -1) {
-        video.currentTime = chapters[nextChapter].segment[0];
+        setCurrentTime(chapters[nextChapter].segment[0]);
     } else {
-        video.currentTime = video.duration;
+        setCurrentTime(getVideoDuration());
     }
 }
 
 function previousChapter(): void {
     if (Date.now() - lastNextChapterKeybind.date < 3000) {
-        video.currentTime = lastNextChapterKeybind.time;
+        setCurrentTime(lastNextChapterKeybind.time);
         lastNextChapterKeybind.date = 0;
         return;
     }
 
     const chapters = previewBar.unfilteredChapterGroups?.filter((time) => [ActionType.Chapter, null].includes(time.actionType));
     if (!chapters || chapters.length <= 0) {
-        video.currentTime = 0;
+        setCurrentTime(0);
         return;
     }
 
     // subtract 5 seconds to allow skipping back to the previous chapter if close to start of
     // the current one
-    const nextChapter = chapters.findIndex((time) => time.segment[0] > video.currentTime - Math.min(5, time.segment[1] - time.segment[0]));
+    const nextChapter = chapters.findIndex((time) => time.segment[0] > getCurrentTime() - Math.min(5, time.segment[1] - time.segment[0]));
     const previousChapter = nextChapter !== -1 ? (nextChapter - 1) : (chapters.length - 1);
     if (previousChapter !== -1) {
-        video.currentTime = chapters[previousChapter].segment[0];
+        setCurrentTime(chapters[previousChapter].segment[0]);
     } else {
-        video.currentTime = 0;
+        setCurrentTime(0);
     }
-}
-
-function addPageListeners(): void {
-    const refreshListners = () => {
-        if (!isVisible(video)) {
-            refreshVideoAttachments();
-        }
-    };
-
-    // inject into document
-    const docScript = document.createElement("script");
-    docScript.src = chrome.runtime.getURL("js/document.js");
-    // Not injected on invidious
-    (document.head || document.documentElement)?.appendChild(docScript);
-
-    document.addEventListener("yt-navigate-start", resetValues);
-    document.addEventListener("yt-navigate-finish", refreshListners);
-    window.addEventListener("message", windowListenerHandler);
 }
 
 function addHotkeyListener(): void {
     document.addEventListener("keydown", hotkeyListener);
+
+    const onLoad = () => {
+        // Allow us to stop propagation to YouTube by being deeper
+        document.removeEventListener("keydown", hotkeyListener);
+        document.body.addEventListener("keydown", hotkeyListener);
+
+        addCleanupListener(() => {
+            document.body.removeEventListener("keydown", hotkeyListener);
+        });
+    };
+
+    if (document.readyState === "complete") {
+        onLoad();
+    } else {
+        document.addEventListener("DOMContentLoaded", onLoad);
+    }
 }
 
 function hotkeyListener(e: KeyboardEvent): void {
-    if (["textarea", "input"].includes(document.activeElement?.tagName?.toLowerCase())
-        || document.activeElement?.id?.toLowerCase()?.includes("editable")) return;
+    if ((["textarea", "input"].includes(document.activeElement?.tagName?.toLowerCase())
+        || (document.activeElement as HTMLElement)?.isContentEditable
+        || document.activeElement?.id?.toLowerCase()?.match(/editable|input/))
+            && document.hasFocus()) return;
 
     const key: Keybind = {
         key: e.key,
@@ -2420,37 +2584,57 @@ function hotkeyListener(e: KeyboardEvent): void {
     };
 
     const skipKey = Config.config.skipKeybind;
+    const skipToHighlightKey = Config.config.skipToHighlightKeybind;
+    const closeSkipNoticeKey = Config.config.closeSkipNoticeKeybind;
     const startSponsorKey = Config.config.startSponsorKeybind;
-    const submitKey = Config.config.submitKeybind;
+    const submitKey = Config.config.actuallySubmitKeybind;
+    const previewKey = Config.config.previewKeybind;
+    const openSubmissionMenuKey = Config.config.submitKeybind;
     const nextChapterKey = Config.config.nextChapterKeybind;
     const previousChapterKey = Config.config.previousChapterKeybind;
 
     if (keybindEquals(key, skipKey)) {
-        if (activeSkipKeybindElement)
+        if (activeSkipKeybindElement) {
             activeSkipKeybindElement.toggleSkip.call(activeSkipKeybindElement);
+        }
+
+        return;
+    } else if (keybindEquals(key, skipToHighlightKey)) {
+        if (skipButtonControlBar) {
+            skipButtonControlBar.toggleSkip.call(skipButtonControlBar);
+        }
+
+        return;
+    } else if (keybindEquals(key, closeSkipNoticeKey)) {
+        for (let i = 0; i < skipNotices.length; i++) {
+            skipNotices.pop().close();
+        }
+        
+        upcomingNotice?.close();
+        upcomingNotice = null;
         return;
     } else if (keybindEquals(key, startSponsorKey)) {
         startOrEndTimingNewSegment();
         return;
     } else if (keybindEquals(key, submitKey)) {
-        submitSponsorTimes();
+        submitSegments();
+        return;
+    } else if (keybindEquals(key, openSubmissionMenuKey)) {
+        e.preventDefault();
+
+        openSubmissionMenu();
+        return;
+    } else if (keybindEquals(key, previewKey)) {
+        previewRecentSegment();
         return;
     } else if (keybindEquals(key, nextChapterKey)) {
+        if (sponsorTimes.length > 0) e.stopPropagation();
         nextChapter();
         return;
     } else if (keybindEquals(key, previousChapterKey)) {
+        if (sponsorTimes.length > 0) e.stopPropagation();
         previousChapter();
         return;
-    }
-
-    //legacy - to preserve keybinds for skipKey, startSponsorKey and submitKey for people who set it before the update. (shouldn't be changed for future keybind options)
-    if (key.key == skipKey?.key && skipKey.code == null && !keybindEquals(Config.syncDefaults.skipKeybind, skipKey)) {
-        if (activeSkipKeybindElement)
-            activeSkipKeybindElement.toggleSkip.call(activeSkipKeybindElement);
-    } else if (key.key == startSponsorKey?.key && startSponsorKey.code == null && !keybindEquals(Config.syncDefaults.startSponsorKeybind, startSponsorKey)) {
-        startOrEndTimingNewSegment();
-    } else if (key.key == submitKey?.key && submitKey.code == null && !keybindEquals(Config.syncDefaults.submitKeybind, submitKey)) {
-        submitSponsorTimes();
     }
 }
 
@@ -2458,8 +2642,8 @@ function hotkeyListener(e: KeyboardEvent): void {
  * Adds the CSS to the page if needed. Required on optional sites with Chrome.
  */
 function addCSS() {
-    if (!utils.isFirefox() && Config.config.invidiousInstances.includes(new URL(document.URL).host)) {
-        window.addEventListener("DOMContentLoaded", () => {
+    if (!isFirefoxOrSafari() && Config.config.invidiousInstances.includes(new URL(document.URL).hostname)) {
+        const onLoad = () => {
             const head = document.getElementsByTagName("head")[0];
 
             for (const file of utils.css) {
@@ -2467,11 +2651,17 @@ function addCSS() {
 
                 fileref.rel = "stylesheet";
                 fileref.type = "text/css";
-                fileref.href = chrome.extension.getURL(file);
+                fileref.href = chrome.runtime.getURL(file);
 
                 head.appendChild(fileref);
             }
-        });
+        };
+
+        if (document.readyState === "complete") {
+            onLoad();
+        } else {
+            document.addEventListener("DOMContentLoaded", onLoad);
+        }
     }
 }
 
@@ -2479,24 +2669,25 @@ function addCSS() {
  * Update the isAdPlaying flag and hide preview bar/controls if ad is playing
  */
 function updateAdFlag(): void {
-    const wasAdPlaying = isAdPlaying;
-    isAdPlaying = document.getElementsByClassName('ad-showing').length > 0;
-    if(wasAdPlaying != isAdPlaying) {
+    const wasAdPlaying = getIsAdPlaying();
+    setIsAdPlaying(document.getElementsByClassName('ad-showing').length > 0);
+    if(wasAdPlaying != getIsAdPlaying()) {
         updatePreviewBar();
         updateVisibilityOfPlayerControlsButton();
     }
 }
 
 function showTimeWithoutSkips(skippedDuration: number): void {
-    if (onInvidious) return;
-
     if (isNaN(skippedDuration) || skippedDuration < 0) {
         skippedDuration = 0;
     }
 
     // YouTube player time display
-    const displayClass = onMobileYouTube ? "ytm-time-display" : "ytp-time-display.notranslate"
-    const display = document.querySelector(`.${displayClass}`);
+    const selector =
+        isOnInvidious()     ? ".vjs-duration" :
+        isOnMobileYouTube() ? ".YtwPlayerTimeDisplayContent" :
+                              ".ytp-time-display.notranslate .ytp-time-wrapper";
+    const display = document.querySelector(selector);
     if (!display) return;
 
     const durationID = "sponsorBlockDurationAfterSkips";
@@ -2506,12 +2697,16 @@ function showTimeWithoutSkips(skippedDuration: number): void {
     if (duration === null) {
         duration = document.createElement('span');
         duration.id = durationID;
-        duration.classList.add(displayClass);
 
-        display.appendChild(duration);
+        if (isOnMobileYouTube()) {
+            duration.style.paddingLeft = "4px";
+            display.insertBefore(duration, display.lastChild);
+        } else {
+            display.appendChild(duration);
+        }
     }
 
-    const durationAfterSkips = GenericUtils.getFormattedTime(video?.duration - skippedDuration);
+    const durationAfterSkips = getFormattedTime(getVideoDuration() - skippedDuration);
 
     duration.innerText = (durationAfterSkips == null || skippedDuration <= 0) ? "" : " (" + durationAfterSkips + ")";
 }
@@ -2530,7 +2725,7 @@ function checkForPreloadedSegment() {
                 if (!sponsorTimesSubmitting.some((s) => s.segment[0] === segment.segment[0] && s.segment[1] === s.segment[1])) {
                     sponsorTimesSubmitting.push({
                         segment: segment.segment,
-                        UUID: GenericUtils.generateUserID() as SegmentUUID,
+                        UUID: generateUserID() as SegmentUUID,
                         category: segment.category ? segment.category : Config.config.defaultCategory,
                         actionType: segment.actionType ? segment.actionType : ActionType.Skip,
                         description: segment.description ?? "",
@@ -2544,23 +2739,51 @@ function checkForPreloadedSegment() {
     }
 
     if (pushed) {
-        Config.config.unsubmittedSegments[sponsorVideoID] = sponsorTimesSubmitting;
-        Config.forceSyncUpdate("unsubmittedSegments");
+        Config.local.unsubmittedSegments[getVideoID()] = sponsorTimesSubmitting;
+        Config.forceLocalUpdate("unsubmittedSegments");
     }
 }
 
-// Register listener for URL change via Navigation API
-const navigationApiAvailable = "navigation" in window;
-if (navigationApiAvailable) {
-    // TODO: Remove type cast once type declarations are updated
-    (window as unknown as { navigation: EventTarget }).navigation.addEventListener("navigate", (e) =>
-        videoIDChange(getYouTubeVideoID(document, (e as unknown as Record<string, Record<string, string>>).destination.url)));
+// Generate and inject a stylesheet that creates CSS variables with configured category colors
+function setCategoryColorCSSVariables() {
+    let styleContainer = document.getElementById("sbCategoryColorStyle");
+    if (!styleContainer) {
+        styleContainer = document.createElement("style");
+        styleContainer.id = "sbCategoryColorStyle";
+
+        const head = (document.head || document.documentElement);
+        head.appendChild(styleContainer)
+    }
+
+    let css = ":root {"
+    for (const [category, config] of Object.entries(Config.config.barTypes)) {
+        css += `--sb-category-${category}: ${config.color};`;
+        css += `--darkreader-bg--sb-category-${category}: ${config.color};`;
+
+        const luminance = GenericUtils.getLuminance(config.color);
+        css += `--sb-category-text-${category}: ${luminance > 128 ? "black" : "white"};`;
+        css += `--darkreader-text--sb-category-text-${category}: ${luminance > 128 ? "black" : "white"};`;
+    }
+    css += "}";
+
+    styleContainer.innerText = css;
 }
 
-// Record availability of Navigation API
-utils.wait(() => Config.local !== null).then(() => {
-    if (Config.local.navigationApiAvailable !== navigationApiAvailable) {
-        Config.local.navigationApiAvailable = navigationApiAvailable;
-        Config.forceLocalUpdate("navigationApiAvailable");
+/**
+ * If mini player starts playing, then videoID change might have to be called
+ */
+function checkForMiniplayerPlaying() {
+    const miniPlayerUI = document.querySelector(".miniplayer") as HTMLElement;
+    if (!onVideoPage() && isVisible(miniPlayerUI)) {
+        const videoID = getLastNonInlineVideoID();
+        if (videoID) {
+            triggerVideoIDChange(videoID);
+
+            // treat as if video element has changed
+            const video = miniPlayerUI.querySelector("video") as HTMLVideoElement;
+            if (video && getVideo() !== video) {
+                triggerVideoElementChange(video);
+            }
+        }
     }
-});
+}

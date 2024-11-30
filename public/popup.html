@@ -20,7 +20,7 @@
         __MSG_betaServerWarning__
       </div>
 
-      <header class="sbPopupLogo">
+      <header id="sbPopupLogo" class="sbPopupLogo">
         <img src="icons/IconSponsorBlocker256px.png" alt="SponsorBlock" width="40" height="40" id="sponsorBlockPopupLogo">
         <p class="u-mZ">SponsorBlock</p>
       </header>
@@ -105,13 +105,13 @@
         <sub class="sponsorStartHint grey-text">__MSG_popupHint__</sub>
         <div style="text-align: center; margin: 8px 0;">
           <button id="sponsorStart" class="sbMediumButton" style="margin-right: 8px">__MSG_sponsorStart__</button>
-          <button id="submitTimes" class="sbMediumButton" style="display: none">__MSG_submitTimesButton__</button>
+          <button id="submitTimes" class="sbMediumButton" style="display: none">__MSG_OpenSubmissionMenu__</button>
         </div>
         <span id="submissionHint" style="display: none">__MSG_submissionEditHint__</span>
       </div>
 
       <!-- Your Work box -->
-      <div class="sbYourWorkBox">
+      <div id="sbYourWorkBox" class="sbYourWorkBox">
         <h1 class="sbHeader" style="padding: 8px 15px;">
           __MSG_yourWork__
         </h1>
@@ -195,14 +195,15 @@
         <a href="https://github.com/ajayyy/SponsorBlock" target="_blank" rel="noopener">GitHub</a>
         <a href="https://discord.gg/SponsorBlock" target="_blank" rel="noopener">Discord</a>
         <a href="https://matrix.to/#/#sponsor:ajay.app?via=ajay.app&via=matrix.org&via=mozilla.org" target="_blank" rel="noopener">Matrix</a>
-        <a href="https://sponsor.ajay.app/donate" target="_blank" rel="noopener" id="sbDonate">$</a>
+        <a href="https://sponsor.ajay.app/donate" target="_blank" rel="noopener" id="sbDonate">__MSG_Donate__</a>
+        <br />
+        <a id="debugLogs">__MSG_copyDebugLogs__</a>
       </footer>
 
       <button id="showNoticeAgain" style="display: none">__MSG_showNotice__</button>
 
     </div>
     <!-- Scripts that need to load after the html -->
-    <script src="./js/vendor.js" async></script>
     <script src="./js/popup.js" async></script>
   </body>
 </html>
